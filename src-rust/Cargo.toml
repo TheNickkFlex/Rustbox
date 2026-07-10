@@ -1,0 +1,72 @@
+[package]
+name = "fluxbox-rs"
+version = "1.4.0"
+edition = "2021"
+description = "Fluxbox window manager - Rust port"
+authors = ["Fluxbox Team <fluxbox@lists.sourceforge.net>"]
+license = "MIT"
+
+[features]
+default = ["xrender", "xinerama", "xrandr", "xshape", "composite"]
+xrender = ["x11rb/render"]
+xinerama = ["x11rb/xinerama"]
+xrandr = ["x11rb/randr"]
+xshape = ["x11rb/shape"]
+composite = ["x11rb/composite", "x11rb/damage"]
+freetype2 = ["ttf-parser"]
+fribidi = ["unicode-bidi"]
+debug = []
+profiling = []
+
+[dependencies]
+# X11 protocol (pure Rust, no C dependencies needed beyond libxcb)
+x11rb = { version = "0.13", features = ["resource_manager", "cursor", "image", "allow-unsafe-code"] }
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Async/event loop
+polling = "3"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# Serde for config parsing
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Image loading
+image = "0.25"
+
+# Font rendering (optional, uses X11 core fonts by default)
+ttf-parser = { version = "0.25", optional = true }
+
+# Unicode support
+unicode-bidi = { version = "0.3", optional = true }
+
+# Regex for config matching
+regex = "1"
+
+# Glob pattern matching
+glob-match = "0.2"
+
+# Signal handling
+signal-hook = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+strip = "symbols"
+panic = "abort"
+
+[profile.bench]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[[bin]]
+name = "fluxbox"
+path = "src/main.rs"
