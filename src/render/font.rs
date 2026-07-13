@@ -23,9 +23,9 @@ pub fn is_emoji(c: char) -> bool {
         || (0x2B00..=0x2BFF).contains(&u)
 }
 
-struct FontData {
-    data: Vec<u8>,
-    face_index: u32,
+pub struct FontData {
+    pub data: Vec<u8>,
+    pub face_index: u32,
 }
 
 static TEXT_DB: OnceLock<fontdb::Database> = OnceLock::new();
@@ -70,7 +70,7 @@ pub fn text_font_ref() -> Option<&'static FontRef<'static>> {
         .as_ref()
 }
 
-fn emoji_font_data() -> Option<&'static FontData> {
+pub fn emoji_font_data() -> Option<&'static FontData> {
     EMOJI_FONT
         .get_or_init(|| {
             // Try fontdb first (scans system font paths).
@@ -150,10 +150,15 @@ pub fn make_emoji_placeholder(cp: u32, px: u32) -> (u32, u32, Vec<u8>) {
 }
 
 /// Render a single emoji code point to an RGBA8 bitmap at roughly `px` pixels
-/// tall, using the color-emoji font's embedded PNG (CBDT/CBLC) when
-/// available, otherwise falling back to the outline glyph (monochrome
-/// silhouette). Returns `None` when no emoji font or glyph is available.
+/// tall. Tries, in order:
+/// 1. COLRv1 vector color glyphs (real colored emojis),
+/// 2. embedded PNG (CBDT/CBLC) when available,
+/// 3. the monochrome outline fallback.
 pub fn render_emoji(cp: u32, px: u32) -> Option<(u32, u32, Vec<u8>)> {
+    if let Some(bmp) = crate::render::emoji::render_emoji_colr(cp, px) {
+        return Some(bmp);
+    }
+
     let fd = emoji_font_data()?;
     let face = Face::parse(&fd.data, fd.face_index).ok()?;
     let ch = char::from_u32(cp)?;
@@ -346,33 +351,9 @@ impl Font {
         lines
     }
 
-    pub fn draw_text(
-        &self,
-        conn: &RustConnection,
-        drawable: u32,
-        gc: Gcontext,
-        x: i16,
-        y: i16,
-        text: &str,
-        fg: u32,
-    ) -> Result<(), anyhow::Error> {
-        // Used by the bitmap fallback path; harmless for the TrueType path.
-        conn.change_gc(gc, &xproto::ChangeGCAux::new().foreground(fg))?;
-
-        let px = self.px();
-        if let Some(fr) = text_font_ref() {
-            return self.draw_truetype(conn, drawable, gc, x, y, text, fg, fr, px);
-        }
-
-        // Fallback: built-in 8x8 bitmap font, drawn via poly_fill_rectangle.
-        let top_y = y - self.ascent as i16;
-        crate::render::bitmap_font::draw_bitmap_text(conn, drawable, gc, x, top_y, text, self.scale)?;
-        Ok(())
-    }
-
-    /// Like `draw_text`, but paints an opaque `bg` behind the glyphs (no
-    /// read-back of the destination needed). Used by notifications, which draw
-    /// text over a solid popup background.
+    /// Paints an opaque `bg` behind the glyphs (no read-back of the destination
+    /// needed). Used by notifications, toolbar, menus and frame titles, which
+    /// draw text over a solid background.
     pub fn draw_text_on_bg(
         &self,
         conn: &RustConnection,
@@ -458,70 +439,6 @@ impl Font {
 
         let width_px = (caret - x).ceil().max(1.0);
         (ops, width_px, ascent_px, height_px)
-    }
-
-    fn draw_truetype(
-        &self,
-        conn: &RustConnection,
-        drawable: u32,
-        gc: Gcontext,
-        x: i16,
-        y: i16,
-        text: &str,
-        fg: u32,
-        font_ref: &FontRef<'static>,
-        px: f32,
-    ) -> Result<(), anyhow::Error> {
-        let (ops, width_px, _ascent_px, height_px) =
-            self.collect_ops(text, font_ref, px, x as f32, y as f32);
-        let bx = x;
-        let by = (y as f32 - _ascent_px).round() as i16;
-        let bw = width_px as u16;
-        let bh = (height_px.ceil().max(1.0)) as u16;
-
-        let (img_x, img_y, img_w, img_h) = clamp_rect(bx, by, bw, bh);
-        if img_w == 0 || img_h == 0 {
-            return Ok(());
-        }
-
-        // Temporary pixmap: copy window → pixmap, get_image on pixmap
-        // (always succeeds), composite, put_image back, copy back to window.
-        let depth = conn.setup().roots[0].root_depth;
-        let tmp = conn.generate_id()?;
-        conn.create_pixmap(depth, tmp, drawable, img_w, img_h)?;
-
-        let result = (|| -> Result<(), anyhow::Error> {
-            conn.copy_area(drawable, tmp, gc, img_x, img_y, 0, 0, img_w, img_h)?;
-
-            let reply = conn
-                .get_image(xproto::ImageFormat::Z_PIXMAP, tmp, 0, 0, img_w, img_h, 0xFFFF_FFFF)
-                .map_err(|e| anyhow::anyhow!("{e}"))?
-                .reply()?;
-            let stride = reply.data.len() / img_h.max(1) as usize;
-            let mut buf = reply.data;
-
-            let (fr, fg_, fb) = unpack_pixel(fg);
-            composite_ops(&mut buf, &ops, img_x, img_y, stride, fr, fg_, fb);
-
-            conn.put_image(
-                xproto::ImageFormat::Z_PIXMAP,
-                tmp,
-                gc,
-                img_w,
-                img_h,
-                0,
-                0,
-                0,
-                depth,
-                &buf,
-            )?;
-
-            conn.copy_area(tmp, drawable, gc, 0, 0, img_x, img_y, img_w, img_h)?;
-            Ok(())
-        })();
-
-        let _ = conn.free_pixmap(tmp);
-        result
     }
 
     fn draw_truetype_bg(

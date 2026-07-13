@@ -38,6 +38,12 @@ pub struct Popup {
     theme: Theme,
     action_rects: Vec<(Rectangle, String)>,
     action_labels: Vec<String>,
+    // Cached pixels to avoid synchronous alloc_color round-trips on redraws.
+    bg_pixel: u32,
+    fg_pixel: u32,
+    frame_pixel: u32,
+    body_pixel: u32,
+    urgency_pixel: u32,
 }
 
 impl Popup {
@@ -117,6 +123,18 @@ impl Popup {
             None
         };
 
+        let white = conn.screen().white_pixel;
+        let black = conn.screen().black_pixel;
+        let bg_pixel = color(conn, theme.bg.0, theme.bg.1, theme.bg.2, black);
+        let fg_pixel = color(conn, theme.fg.0, theme.fg.1, theme.fg.2, white);
+        let frame_pixel = color(conn, theme.frame.0, theme.frame.1, theme.frame.2, black);
+        let body_pixel = color(conn, theme.body.0, theme.body.1, theme.body.2, white);
+        let urgency_pixel = match notif.urgency {
+            Urgency::Low => color(conn, theme.urgency[0].0, theme.urgency[0].1, theme.urgency[0].2, white),
+            Urgency::Normal => color(conn, theme.urgency[1].0, theme.urgency[1].1, theme.urgency[1].2, white),
+            Urgency::Critical => color(conn, theme.urgency[2].0, theme.urgency[2].1, theme.urgency[2].2, white),
+        };
+
         let mut p = Self {
             window,
             gc,
@@ -130,6 +148,11 @@ impl Popup {
             theme,
             action_rects: Vec::new(),
             action_labels: Vec::new(),
+            bg_pixel,
+            fg_pixel,
+            frame_pixel,
+            body_pixel,
+            urgency_pixel,
         };
         p.compute_layout();
         p.redraw(conn)?;
@@ -241,19 +264,13 @@ impl Popup {
     pub fn redraw(&self, conn: &X11Connection) -> Result<(), anyhow::Error> {
         let c = conn.conn();
         let white = conn.screen().white_pixel;
-        let black = conn.screen().black_pixel;
-        let t = self.theme;
 
-        let bg = color(conn, t.bg.0, t.bg.1, t.bg.2, black);
-        let fg = color(conn, t.fg.0, t.fg.1, t.fg.2, white);
-        let frame = color(conn, t.frame.0, t.frame.1, t.frame.2, black);
-        let body_c = color(conn, t.body.0, t.body.1, t.body.2, white);
+        let bg = self.bg_pixel;
+        let fg = self.fg_pixel;
+        let frame = self.frame_pixel;
+        let body_c = self.body_pixel;
         let rc = conn.conn();
-        let ucolor = match self.notif.urgency {
-            Urgency::Low => color(conn, t.urgency[0].0, t.urgency[0].1, t.urgency[0].2, white),
-            Urgency::Normal => color(conn, t.urgency[1].0, t.urgency[1].1, t.urgency[1].2, white),
-            Urgency::Critical => color(conn, t.urgency[2].0, t.urgency[2].1, t.urgency[2].2, white),
-        };
+        let ucolor = self.urgency_pixel;
 
         // Background.
         self.set_fg(conn, bg);

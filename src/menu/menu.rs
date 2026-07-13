@@ -529,8 +529,11 @@ impl Menu {
         current
     }
 
-    /// Destroy the X11 window and free resources.
+    /// Destroy the X11 window and free resources, recursively destroying any submenus.
     pub fn destroy(&self, conn: &X11Connection) -> Result<(), anyhow::Error> {
+        if let Some(sub) = &self.submenu {
+            sub.destroy(conn)?;
+        }
         conn.conn().destroy_window(self.window)?;
         conn.conn().free_gc(self.gc)?;
         Ok(())

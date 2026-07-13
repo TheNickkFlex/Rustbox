@@ -13,6 +13,8 @@ pub mod render;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use dbus::arg::Variant;
@@ -23,6 +25,26 @@ use dbus::MessageType;
 use regex::Regex;
 
 use crate::render::image::ImageControl;
+
+/// Commands delivered to the notification daemon through the in-process Rust
+/// channel, which is an alternative to the D-Bus `org.freedesktop.Notifications`
+/// service. This lets the WM (and other Rust code) raise complex notifications —
+/// with actions, icons, progress bars, markup, stack tags — without requiring a
+/// running session bus.
+#[derive(Debug)]
+pub enum NotifyCommand {
+    /// Show a notification built in Rust (no D-Bus involved).
+    Notify(RawNotification),
+    /// Close a notification by its id.
+    Close(u32),
+    /// Close every currently displayed notification.
+    CloseAll,
+}
+
+/// Global sender side of the in-process notification channel. Initialized once
+/// when the daemon is created; any Rust code can grab it via
+/// [`NotifyDaemon::channel`] to raise notifications without D-Bus.
+static NOTIFY_SENDER: OnceLock<Sender<NotifyCommand>> = OnceLock::new();
 use crate::x11::X11Connection;
 
 /// Where on the screen notifications stack from.
@@ -221,9 +243,15 @@ impl Config {
     }
 }
 
-/// The notification daemon. Owns the D-Bus session name and the popup windows.
+/// The notification daemon. Owns the D-Bus session name (when available) and
+/// the popup windows. It also exposes an in-process Rust channel (`NotifyCommand`)
+/// so notifications can be raised without D-Bus.
 pub struct NotifyDaemon {
-    conn: DbusConn,
+    /// D-Bus session connection. `None` when no session bus is available — the
+    /// daemon still works via the in-process channel in that case.
+    dbus: Option<DbusConn>,
+    /// Receiver end of the in-process notification channel.
+    recv: Receiver<NotifyCommand>,
     next_id: u32,
     config: Config,
     paused: bool,
@@ -242,35 +270,48 @@ pub struct NotifyDaemon {
 }
 
 impl NotifyDaemon {
-    /// Try to become the `org.freedesktop.Notifications` provider. Returns
-    /// `None` if D-Bus is unavailable (the WM keeps running without it).
-    pub fn new(conn: &X11Connection) -> Option<Self> {
+    /// Create the notification daemon. The D-Bus `org.freedesktop.Notifications`
+    /// name is claimed when a session bus is available; otherwise the daemon
+    /// runs D-Bus-free and notifications are delivered only through the
+    /// in-process Rust channel. Always returns a usable daemon.
+    pub fn new(conn: &X11Connection) -> Self {
         let dbus = match DbusConn::new_session() {
-            Ok(c) => c,
+            Ok(c) => {
+                match c.register_name("org.freedesktop.Notifications", 1 | 2) {
+                    Ok(reply) => {
+                        log::info!("Claimed org.freedesktop.Notifications (reply={:?})", reply)
+                    }
+                    Err(e) => log::warn!("Could not claim org.freedesktop.Notifications: {}", e),
+                }
+                // Register the object paths so libdbus routes method calls to
+                // our message queue instead of auto-replying with "UnknownMethod".
+                if let Err(e) = c.register_object_path("/org/freedesktop/Notifications") {
+                    log::warn!("Failed to register notification object path: {}", e);
+                }
+                if let Err(e) = c.register_object_path("/org/dunstproject/cmd0") {
+                    log::warn!("Failed to register dunst control object path: {}", e);
+                }
+                Some(c)
+            }
             Err(e) => {
-                log::warn!("Notification daemon disabled (no D-Bus session): {}", e);
-                return None;
+                log::warn!(
+                    "D-Bus session unavailable; notifications work via in-process channel only: {}",
+                    e
+                );
+                None
             }
         };
 
-        match dbus.register_name("org.freedesktop.Notifications", 1 | 2) {
-            Ok(reply) => log::info!("Claimed org.freedesktop.Notifications (reply={:?})", reply),
-            Err(e) => log::warn!("Could not claim org.freedesktop.Notifications: {}", e),
-        }
-
-        // Register the object paths so libdbus routes method calls to our
-        // message queue instead of auto-replying with "UnknownMethod".
-        if let Err(e) = dbus.register_object_path("/org/freedesktop/Notifications") {
-            log::warn!("Failed to register notification object path: {}", e);
-        }
-        if let Err(e) = dbus.register_object_path("/org/dunstproject/cmd0") {
-            log::warn!("Failed to register dunst control object path: {}", e);
-        }
+        // In-process Rust channel: the Sender side is published globally so any
+        // Rust code can raise notifications without D-Bus.
+        let (tx, rx) = channel::<NotifyCommand>();
+        let _ = NOTIFY_SENDER.set(tx);
 
         let screen = conn.screen();
         let config = Self::load_config(&Self::config_path());
         let mut d = Self {
-            conn: dbus,
+            dbus,
+            recv: rx,
             next_id: 1,
             config,
             paused: false,
@@ -283,7 +324,15 @@ impl NotifyDaemon {
             screen_height: screen.height_in_pixels,
         };
         d.relayout(conn);
-        Some(d)
+        d
+    }
+
+    /// Global sender for the in-process notification channel. Panics if the
+    /// daemon has not been created yet (call [`NotifyDaemon::new`] first).
+    pub fn channel() -> &'static Sender<NotifyCommand> {
+        NOTIFY_SENDER
+            .get()
+            .expect("notify channel not initialized; create NotifyDaemon first")
     }
 
     pub fn set_screen_size(&mut self, w: u16, h: u16) {
@@ -292,11 +341,16 @@ impl NotifyDaemon {
     }
 
     /// Drain and dispatch any pending D-Bus messages. Non-blocking: with a
-    /// zero timeout libdbus only processes already-buffered messages.
+    /// zero timeout libdbus only processes already-buffered messages. No-op
+    /// when the daemon runs without a D-Bus session.
     pub fn process_dbus(&mut self, conn: &X11Connection) {
+        let db = match self.dbus.as_ref() {
+            Some(db) => db,
+            None => return,
+        };
         let mut msgs = Vec::new();
         loop {
-            match self.conn.incoming(0).next() {
+            match db.incoming(0).next() {
                 Some(msg) if msg.msg_type() == MessageType::MethodCall => msgs.push(msg),
                 Some(_) => {}
                 None => break,
@@ -304,6 +358,38 @@ impl NotifyDaemon {
         }
         for msg in msgs {
             self.handle_method_call(msg, conn);
+        }
+    }
+
+    /// Drain and dispatch notifications delivered through the in-process Rust
+    /// channel (the D-Bus-free alternative). Runs once per main-loop iteration.
+    pub fn process_internal(&mut self, conn: &X11Connection) {
+        while let Ok(cmd) = self.recv.try_recv() {
+            match cmd {
+                NotifyCommand::Notify(mut notif) => {
+                    // Assign a stable id (the D-Bus path does this in
+                    // handle_method_call; the channel path must do it here).
+                    if notif.id == 0 {
+                        notif.id = self.next_id;
+                        self.next_id = self.next_id.wrapping_add(1).max(1);
+                    }
+                    self.enqueue(notif, conn)
+                }
+                NotifyCommand::Close(id) => self.close(id, CloseReason::ClosedByCaller, conn),
+                NotifyCommand::CloseAll => {
+                    let ids: Vec<u32> = self.displayed.iter().map(|p| p.notif.id).collect();
+                    for id in ids {
+                        self.close(id, CloseReason::ClosedByCaller, conn);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Send a D-Bus message only when a session bus is present.
+    fn dbus_send(&self, msg: Message) {
+        if let Some(db) = &self.dbus {
+            let _ = db.send(msg);
         }
     }
 
@@ -327,12 +413,14 @@ impl NotifyDaemon {
                     "x-canonical-private-synchronous",
                     "x-dunst-stack-tag",
                 ];
-                let _ = self.conn.send(msg.method_return().append1(caps));
+                let _ = self.dbus_send(msg.method_return().append1(caps));
             }
             ("org.freedesktop.Notifications", "GetServerInformation") => {
-                let _ = self
-                    .conn
-                    .send(msg.method_return().append3("rustbox", "rustbox", "1.4.0").append1("1.2"));
+                let _ = self.dbus_send(
+                    msg.method_return()
+                        .append3("rustbox", "rustbox", "1.4.0")
+                        .append1("1.2"),
+                );
             }
             ("org.dunstproject.cmd0", m) => {
                 self.handle_control(m, msg, conn);
@@ -429,16 +517,16 @@ impl NotifyDaemon {
                 }
                 self.enqueue(notif, conn);
 
-                let _ = self.conn.send(msg.method_return().append1(id));
+                let _ = self.dbus_send(msg.method_return().append1(id));
             }
             ("org.freedesktop.Notifications", "CloseNotification") => {
                 let id: u32 = msg.read1().unwrap_or(0);
                 self.close(id, CloseReason::ClosedByCaller, conn);
-                let _ = self.conn.send(msg.method_return());
+                let _ = self.dbus_send(msg.method_return());
             }
             _ => {
                 let name = ErrorName::new("org.freedesktop.DBus.Error.UnknownMethod").unwrap();
-                let _ = self.conn.send(msg.error(&name, c"no such method"));
+                let _ = self.dbus_send(msg.error(&name, c"no such method"));
             }
         }
     }
@@ -447,15 +535,19 @@ impl NotifyDaemon {
     fn enqueue(&mut self, mut notif: RawNotification, conn: &X11Connection) {
         let skip = Self::apply_rules(&mut notif, &self.config.rules);
         if skip {
-            if !notif.history_ignore {
-                self.history.push(notif.clone());
-            }
             if let Ok(sig) = Message::new_signal(
                 "/org/freedesktop/Notifications",
                 "org.freedesktop.Notifications",
                 "NotificationClosed",
             ) {
-                let _ = self.conn.send(sig.append2(notif.id, CloseReason::Undefined as u32));
+                let _ = self.dbus_send(sig.append2(notif.id, CloseReason::Undefined as u32));
+            }
+            if !notif.history_ignore {
+                notif.icon_data = None; // Strip heavy raw image bytes before saving to history
+                self.history.push(notif);
+                if self.history.len() > 50 {
+                    self.history.remove(0);
+                }
             }
             return;
         }
@@ -479,6 +571,12 @@ impl NotifyDaemon {
                 Err(e) => log::warn!("Failed to create notification popup: {}", e),
             }
         } else {
+            // Bound the waiting queue so a flood of notifications cannot grow
+            // RAM/VRAM without limit. Drop the oldest pending entry.
+            const WAITING_MAX: usize = 100;
+            if self.waiting.len() >= WAITING_MAX {
+                self.waiting.remove(0);
+            }
             self.waiting.push(notif);
         }
         self.relayout(conn);
@@ -529,10 +627,11 @@ impl NotifyDaemon {
     pub fn close(&mut self, id: u32, reason: CloseReason, conn: &X11Connection) {
         if let Some(pos) = self.displayed.iter().position(|p| p.notif.id == id) {
             let p = self.displayed.remove(pos);
-            let notif = p.notif.clone();
+            let mut notif = p.notif.clone();
             let sync_key = notif.sync_key.clone();
             p.destroy(conn);
             if !notif.transient && !notif.history_ignore {
+                notif.icon_data = None; // Strip heavy raw image bytes before saving to history
                 self.history.push(notif);
                 if self.history.len() > 50 {
                     self.history.remove(0);
@@ -540,7 +639,11 @@ impl NotifyDaemon {
             }
             self.emit_closed(id, reason);
             if let Some(key) = sync_key {
-                self.sync_map.remove(&key);
+                // Only drop the sync mapping if it still points at this id; a
+                // newer notification may have replaced it under the same key.
+                if self.sync_map.get(&key).copied() == Some(id) {
+                    self.sync_map.remove(&key);
+                }
             }
             self.relayout(conn);
         } else {
@@ -603,7 +706,7 @@ impl NotifyDaemon {
             "org.freedesktop.Notifications",
             "NotificationClosed",
         ) {
-            let _ = self.conn.send(sig.append2(id, reason as u32));
+            let _ = self.dbus_send(sig.append2(id, reason as u32));
         }
     }
 
@@ -613,7 +716,7 @@ impl NotifyDaemon {
             "org.freedesktop.Notifications",
             "ActionInvoked",
         ) {
-            let _ = self.conn.send(sig.append2(id, action_key.to_string()));
+            let _ = self.dbus_send(sig.append2(id, action_key.to_string()));
         }
     }
 
@@ -622,59 +725,59 @@ impl NotifyDaemon {
     fn handle_control(&mut self, member: &str, msg: Message, conn: &X11Connection) {
         match member {
             "ping" => {
-                let _ = self.conn.send(msg.method_return().append1("pong"));
+                let _ = self.dbus_send(msg.method_return().append1("pong"));
             }
             "pause" => {
                 self.set_paused(true);
-                let _ = self.conn.send(msg.method_return());
+                let _ = self.dbus_send(msg.method_return());
             }
             "resume" => {
                 self.set_paused(false);
-                let _ = self.conn.send(msg.method_return());
+                let _ = self.dbus_send(msg.method_return());
             }
             "isPaused" => {
-                let _ = self.conn.send(msg.method_return().append1(self.paused()));
+                let _ = self.dbus_send(msg.method_return().append1(self.paused()));
             }
             "closeAll" => {
                 let ids: Vec<u32> = self.displayed.iter().map(|p| p.notif.id).collect();
                 for id in ids {
                     self.close(id, CloseReason::User, conn);
                 }
-                let _ = self.conn.send(msg.method_return());
+                let _ = self.dbus_send(msg.method_return());
             }
             "close" => {
                 let id: u32 = msg.read1().unwrap_or(0);
                 self.close(id, CloseReason::ClosedByCaller, conn);
-                let _ = self.conn.send(msg.method_return());
+                let _ = self.dbus_send(msg.method_return());
             }
             "closeLast" => {
                 if let Some(id) = self.displayed.last().map(|p| p.notif.id) {
                     self.close(id, CloseReason::User, conn);
                 }
-                let _ = self.conn.send(msg.method_return());
+                let _ = self.dbus_send(msg.method_return());
             }
             "historyCount" => {
-                let _ = self.conn.send(msg.method_return().append1(self.history.len() as u32));
+                let _ = self.dbus_send(msg.method_return().append1(self.history.len() as u32));
             }
             "clearHistory" => {
                 self.history.clear();
-                let _ = self.conn.send(msg.method_return());
+                let _ = self.dbus_send(msg.method_return());
             }
             "removeFromHistory" => {
                 let id: u32 = msg.read1().unwrap_or(0);
                 self.history.retain(|n| n.id != id);
-                let _ = self.conn.send(msg.method_return());
+                let _ = self.dbus_send(msg.method_return());
             }
             "popHistory" => {
                 // Re-display the most recent history entry if a slot is free.
                 if let Some(n) = self.history.pop() {
                     self.enqueue(n, conn);
                 }
-                let _ = self.conn.send(msg.method_return());
+                let _ = self.dbus_send(msg.method_return());
             }
             "configReload" => {
                 self.reload_config(conn);
-                let _ = self.conn.send(msg.method_return());
+                let _ = self.dbus_send(msg.method_return());
             }
             "history" | "getHistory" => {
                 let hist: Vec<(u32, String, String, String, u32)> = self
@@ -690,7 +793,7 @@ impl NotifyDaemon {
                         )
                     })
                     .collect();
-                let _ = self.conn.send(msg.method_return().append1(hist));
+                let _ = self.dbus_send(msg.method_return().append1(hist));
             }
             "context" => {
                 let id: u32 = msg.read1().unwrap_or(0);
@@ -706,11 +809,11 @@ impl NotifyDaemon {
                             .map(|n| n.actions.clone())
                     })
                     .unwrap_or_default();
-                let _ = self.conn.send(msg.method_return().append2(id, actions));
+                let _ = self.dbus_send(msg.method_return().append2(id, actions));
             }
             _ => {
                 let name = ErrorName::new("org.freedesktop.DBus.Error.UnknownMethod").unwrap();
-                let _ = self.conn.send(msg.error(&name, c"no such control method"));
+                let _ = self.dbus_send(msg.error(&name, c"no such control method"));
             }
         }
     }
@@ -1171,6 +1274,139 @@ fn decode_image_data(value: &dyn dbus::arg::RefArg) -> Option<Vec<u8>> {
         }
     }
     Some(out)
+}
+
+/// Builder for complex notifications raised entirely in Rust, without D-Bus.
+///
+/// Example:
+/// ```text
+/// use rustbox::notify::notify;
+/// notify("Rustbox", "Compilado!")
+///     .body("Build concluído sem erros")
+///     .icon("rust")
+///     .urgency(rustbox::notify::Urgency::Normal)
+///     .timeout(4000)
+///     .action("open", "Abrir")
+///     .show()
+///     .ok();
+/// ```
+pub struct NotificationBuilder {
+    notif: RawNotification,
+}
+
+impl NotificationBuilder {
+    /// Start a notification from `app_name` with the given `summary`.
+    pub fn new(app_name: &str, summary: &str) -> Self {
+        Self {
+            notif: RawNotification {
+                id: 0,
+                app_name: app_name.to_string(),
+                app_icon: String::new(),
+                summary: summary.to_string(),
+                body: String::new(),
+                actions: Vec::new(),
+                urgency: Urgency::Normal,
+                transient: false,
+                expire_timeout: -1,
+                created: Instant::now(),
+                icon_data: None,
+                sync_key: None,
+                stack_tag: None,
+                category: None,
+                desktop_entry: None,
+                progress: None,
+                history_ignore: false,
+            },
+        }
+    }
+
+    pub fn body(mut self, body: &str) -> Self {
+        self.notif.body = body.to_string();
+        self
+    }
+
+    /// Icon by file path or freedesktop theme icon name.
+    pub fn icon(mut self, icon: &str) -> Self {
+        self.notif.app_icon = icon.to_string();
+        self
+    }
+
+    /// Raw RGBA8 icon bytes (precedence over `icon`).
+    pub fn icon_data(mut self, rgba: Vec<u8>) -> Self {
+        self.notif.icon_data = Some(rgba);
+        self
+    }
+
+    pub fn urgency(mut self, u: Urgency) -> Self {
+        self.notif.urgency = u;
+        self
+    }
+
+    /// Milliseconds; -1 => configured default, 0 => sticky.
+    pub fn timeout(mut self, ms: i32) -> Self {
+        self.notif.expire_timeout = ms;
+        self
+    }
+
+    pub fn transient(mut self, b: bool) -> Self {
+        self.notif.transient = b;
+        self
+    }
+
+    pub fn stack_tag(mut self, tag: &str) -> Self {
+        self.notif.stack_tag = Some(tag.to_string());
+        self
+    }
+
+    pub fn category(mut self, c: &str) -> Self {
+        self.notif.category = Some(c.to_string());
+        self
+    }
+
+    pub fn desktop_entry(mut self, d: &str) -> Self {
+        self.notif.desktop_entry = Some(d.to_string());
+        self
+    }
+
+    /// Render a 0..=100 progress bar in the popup.
+    pub fn progress(mut self, value: u8) -> Self {
+        self.notif.progress = Some(value.min(100));
+        self
+    }
+
+    /// `x-canonical-private-synchronous` key: replaces an existing
+    /// notification with the same key instead of stacking.
+    pub fn sync_key(mut self, key: &str) -> Self {
+        self.notif.sync_key = Some(key.to_string());
+        self
+    }
+
+    /// Drop from history when closed.
+    pub fn history_ignore(mut self, b: bool) -> Self {
+        self.notif.history_ignore = b;
+        self
+    }
+
+    /// Add an action button (key + human label).
+    pub fn action(mut self, key: &str, label: &str) -> Self {
+        self.notif.actions.push((key.to_string(), label.to_string()));
+        self
+    }
+
+    /// Deliver the notification through the in-process Rust channel (no D-Bus).
+    pub fn show(self) -> Result<(), std::sync::mpsc::SendError<NotifyCommand>> {
+        NotifyDaemon::channel().send(NotifyCommand::Notify(self.notif))
+    }
+}
+
+/// Convenience constructor for the [`NotificationBuilder`] (D-Bus-free).
+pub fn notify(app_name: &str, summary: &str) -> NotificationBuilder {
+    NotificationBuilder::new(app_name, summary)
+}
+
+/// Deliver a pre-built [`RawNotification`] through the in-process channel.
+pub fn notify_raw(notif: RawNotification) -> Result<(), std::sync::mpsc::SendError<NotifyCommand>> {
+    NotifyDaemon::channel().send(NotifyCommand::Notify(notif))
 }
 
 #[cfg(test)]

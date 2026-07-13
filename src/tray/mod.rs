@@ -629,6 +629,12 @@ impl FbTray {
         }
         let _ = conn.conn().free_gc(self.gc);
         let _ = conn.conn().destroy_window(self.popup_window);
+        // Free any SNI icon pixmaps to avoid leaking server-side VRAM.
+        for slot in &self.sni_slots {
+            if let Some(pm) = slot.pixmap {
+                let _ = conn.conn().free_pixmap(pm);
+            }
+        }
         conn.conn().destroy_window(self.window)?;
         Ok(())
     }

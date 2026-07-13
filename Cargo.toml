@@ -46,6 +46,10 @@ fontdb = "0.21"
 ab_glyph = "0.2"
 skrifa = "0.44"
 
+# COLRv1 color-emoji rasterization (vector glyphs -> RGBA bitmaps)
+tiny-skia = "0.11"
+read-fonts = "0.41"
+
 # Unicode support
 unicode-bidi = { version = "0.3", optional = true }
 
