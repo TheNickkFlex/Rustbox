@@ -1,16 +1,48 @@
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{self, EventMask, WindowClass, ConnectionExt as _};
+use x11rb::protocol::xproto::Segment;
 
 use crate::core::Rectangle;
 use crate::render::font::Font;
 use crate::render::texture::{Texture, TextureRender};
 use crate::x11::X11Connection;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ButtonType {
+    Close,
+    Maximize,
+    Iconify,
+    Shade,
+    Stick,
+    Menu,
+}
+
+pub struct FrameButton {
+    pub rect: Rectangle,
+    pub btn_type: ButtonType,
+    pub pressed: bool,
+}
+
+impl FrameButton {
+    fn new(btn_type: ButtonType, x: i16, y: i16, size: u16) -> Self {
+        Self { rect: Rectangle::new(x, y, size, size), btn_type, pressed: false }
+    }
+
+    fn draw_glyph(&self, conn: &X11Connection, w: u32, gc: u32) -> Result<(), anyhow::Error> {
+        match self.btn_type {
+            ButtonType::Close => draw_close_glyph(conn, w, gc, &self.rect),
+            ButtonType::Maximize => draw_maximize_glyph(conn, w, gc, &self.rect),
+            ButtonType::Iconify => draw_iconify_glyph(conn, w, gc, &self.rect),
+            _ => Ok(()),
+        }
+    }
+}
+
 pub struct FbWinFrame {
-    frame_window: u32,
-    title_window: u32,
-    handle_window: u32,
-    client_window: u32,
+    pub frame_window: u32,
+    pub title_window: u32,
+    pub handle_window: u32,
+    pub client_window: u32,
     width: u16,
     height: u16,
     title_height: u16,
@@ -20,14 +52,54 @@ pub struct FbWinFrame {
     handles_visible: bool,
     tab_width: u16,
     label: String,
-    iconified: bool,
-    maximized: bool,
-    shaded: bool,
-    focused: bool,
+    pub iconified: bool,
+    pub maximized: bool,
+    pub shaded: bool,
+    pub focused: bool,
     texture: Texture,
     gc: Option<xproto::Gcontext>,
     font: Font,
-    close_rect: Rectangle,
+    buttons: Vec<FrameButton>,
+    resize_cursor: Option<u32>,
+}
+
+const BTN_SIZE: u16 = 18;
+const BTN_GAP: i16 = 2;
+
+// Helper: draw a button shape using segments/rectangles instead of text.
+
+fn draw_close_glyph(conn: &X11Connection, w: u32, gc: u32, r: &Rectangle) -> Result<(), anyhow::Error> {
+    let inset = 3i16;
+    let x1 = r.x + inset;
+    let y1 = r.y + inset;
+    let x2 = r.x + r.width as i16 - inset;
+    let y2 = r.y + r.height as i16 - inset;
+    let segs = &[
+        Segment { x1, y1, x2, y2 },
+        Segment { x1: x2, y1, x2: x1, y2 },
+    ];
+    conn.conn().poly_segment(w, gc, segs)?;
+    Ok(())
+}
+
+fn draw_maximize_glyph(conn: &X11Connection, w: u32, gc: u32, r: &Rectangle) -> Result<(), anyhow::Error> {
+    let inset = 3i16;
+    let x = r.x + inset;
+    let y = r.y + inset;
+    let sz = r.width as i16 - inset * 2;
+    let rects = &[xproto::Rectangle { x, y, width: sz as u16, height: sz as u16 }];
+    conn.conn().poly_rectangle(w, gc, rects)?;
+    Ok(())
+}
+
+fn draw_iconify_glyph(conn: &X11Connection, w: u32, gc: u32, r: &Rectangle) -> Result<(), anyhow::Error> {
+    let inset = 4i16;
+    let y = r.y + r.height as i16 / 2;
+    let segs = &[
+        Segment { x1: r.x + inset, y1: y, x2: r.x + r.width as i16 - inset, y2: y },
+    ];
+    conn.conn().poly_segment(w, gc, segs)?;
+    Ok(())
 }
 
 impl FbWinFrame {
@@ -43,8 +115,6 @@ impl FbWinFrame {
         let bevel_width = 2;
 
         let frame = conn.conn().generate_id()?;
-        // override_redirect so (un)mapping the frame never generates a
-        // MapRequest/ConfigureRequest back to us (avoids a manage loop).
         conn.conn().create_window(
             0, frame, parent,
             0, 0, width, height.saturating_add(title_height).saturating_add(border_width * 2),
@@ -52,7 +122,6 @@ impl FbWinFrame {
             WindowClass::INPUT_OUTPUT,
             0,
             &xproto::CreateWindowAux::new()
-                .override_redirect(1)
                 .background_pixel(conn.screen().white_pixel)
                 .event_mask(
                     EventMask::EXPOSURE
@@ -91,7 +160,15 @@ impl FbWinFrame {
             0,
             WindowClass::INPUT_OUTPUT,
             0,
-            &xproto::CreateWindowAux::new().background_pixel(conn.screen().white_pixel),
+            &xproto::CreateWindowAux::new()
+                .background_pixel(conn.screen().white_pixel)
+                .event_mask(
+                    EventMask::BUTTON_PRESS
+                        | EventMask::BUTTON_RELEASE
+                        | EventMask::POINTER_MOTION
+                        | EventMask::ENTER_WINDOW
+                        | EventMask::LEAVE_WINDOW,
+                ),
         )?;
 
         conn.conn().reparent_window(
@@ -100,25 +177,26 @@ impl FbWinFrame {
             (border_width + title_height) as i16,
         )?;
 
-        // One GC for the frame's lifetime; reused for every title redraw.
         let gc = conn.conn().generate_id()?;
         conn.conn().create_gc(gc, frame, &xproto::CreateGCAux::new())?;
 
-        // Title-bar font (falls back to a no-op font if "fixed" is missing).
-        let font = Font::load_x11_font(conn.conn(), "fixed")
-            .unwrap_or_else(|_| Font::new("fixed"));
-        log::debug!("frame font x_id present: {}", font.x_id().is_some());
+        let font = Font::new("fixed");
 
-        // Close button sits on the right edge of the title bar.
-        let btn: u16 = 16;
-        let close_rect = Rectangle::new(
-            (width.saturating_sub(btn + 2)) as i16,
-            3,
-            btn,
-            btn,
-        );
+        // Best-effort: create a resize cursor for the handle_window.
+        let resize_cursor = (|| -> Option<u32> {
+            let font = conn.conn().generate_id().ok()?;
+            conn.conn().open_font(font, b"cursor").ok()?;
+            let cursor = conn.conn().generate_id().ok()?;
+            conn.conn().create_glyph_cursor(
+                cursor, font, font,
+                96, 96, // XC_bottom_right_corner
+                0, 0, 0, 0xffff, 0xffff, 0xffff,
+            ).ok()?;
+            let _ = conn.conn().close_font(font);
+            Some(cursor)
+        })();
 
-        Ok(Self {
+        let mut frame_ = Self {
             frame_window: frame,
             title_window: title,
             handle_window: handle,
@@ -139,8 +217,30 @@ impl FbWinFrame {
             texture: Texture::new(),
             gc: Some(gc),
             font,
-            close_rect,
-        })
+            buttons: Vec::new(),
+            resize_cursor,
+        };
+        frame_.layout_buttons();
+        Ok(frame_)
+    }
+
+    pub fn layout_buttons(&mut self) {
+        self.buttons.clear();
+        let x_start = (self.width.saturating_sub(3 * (BTN_SIZE + BTN_GAP as u16) + 2)) as i16;
+        let y = 3i16;
+        self.buttons.push(FrameButton::new(ButtonType::Iconify, x_start, y, BTN_SIZE));
+        self.buttons.push(FrameButton::new(
+            ButtonType::Maximize,
+            x_start + (BTN_SIZE as i16 + BTN_GAP),
+            y,
+            BTN_SIZE,
+        ));
+        self.buttons.push(FrameButton::new(
+            ButtonType::Close,
+            x_start + 2 * (BTN_SIZE as i16 + BTN_GAP),
+            y,
+            BTN_SIZE,
+        ));
     }
 
     pub fn frame_window(&self) -> u32 {
@@ -155,7 +255,52 @@ impl FbWinFrame {
         self.handle_window
     }
 
-    pub fn resize(&self, conn: &X11Connection, width: u16, height: u16) -> Result<(), anyhow::Error> {
+    /// Width of the client area (excludes borders, includes frame border).
+    pub fn client_width(&self) -> u16 {
+        self.width
+    }
+
+    pub fn client_height(&self) -> u16 {
+        self.height
+    }
+
+    pub fn border_width(&self) -> u16 {
+        self.border_width
+    }
+
+    pub fn title_height(&self) -> u16 {
+        self.title_height
+    }
+
+    fn configure_handle(&self, conn: &X11Connection) -> Result<(), anyhow::Error> {
+        const HANDLE_H: u16 = 6;
+        if self.shaded {
+            let _ = conn.conn().unmap_window(self.handle_window);
+        } else {
+            let bw = self.border_width as i16;
+            let handle_y = (bw + self.title_height as i16 + self.height as i16)
+                .saturating_sub(HANDLE_H as i16)
+                .max(bw);
+            let _ = conn.conn().map_window(self.handle_window);
+            let aux = xproto::ConfigureWindowAux::new()
+                .x(bw as i32)
+                .y(handle_y as i32)
+                .width(self.width as u32)
+                .height(HANDLE_H as u32);
+            if let Some(cursor) = self.resize_cursor {
+                let _ = conn.conn().change_window_attributes(
+                    self.handle_window,
+                    &xproto::ChangeWindowAttributesAux::new().cursor(cursor),
+                );
+            }
+            conn.conn().configure_window(self.handle_window, &aux)?;
+        }
+        Ok(())
+    }
+
+    pub fn resize(&mut self, conn: &X11Connection, width: u16, height: u16) -> Result<(), anyhow::Error> {
+        self.width = width;
+        self.height = height;
         let frame_height = if self.shaded {
             self.title_height + self.border_width * 2
         } else {
@@ -168,7 +313,43 @@ impl FbWinFrame {
                 .width(width as u32)
                 .height(frame_height as u32),
         )?;
+        conn.conn().configure_window(
+            self.title_window,
+            &xproto::ConfigureWindowAux::new().width(width as u32),
+        )?;
 
+        self.configure_handle(conn)?;
+        self.layout_buttons();
+        Ok(())
+    }
+
+    pub fn move_resize(
+        &mut self,
+        conn: &X11Connection,
+        x: i16, y: i16,
+        w: u16, h: u16,
+    ) -> Result<(), anyhow::Error> {
+        self.width = w;
+        self.height = h;
+        let fh = if self.shaded {
+            self.title_height + self.border_width * 2
+        } else {
+            h.saturating_add(self.title_height).saturating_add(self.border_width * 2)
+        };
+        conn.conn().configure_window(
+            self.frame_window,
+            &xproto::ConfigureWindowAux::new()
+                .x(x as i32)
+                .y(y as i32)
+                .width(w as u32)
+                .height(fh as u32),
+        )?;
+        conn.conn().configure_window(
+            self.title_window,
+            &xproto::ConfigureWindowAux::new().width(w as u32),
+        )?;
+        self.configure_handle(conn)?;
+        self.layout_buttons();
         Ok(())
     }
 
@@ -183,11 +364,9 @@ impl FbWinFrame {
     }
 
     pub fn show(&self, conn: &X11Connection) -> Result<(), anyhow::Error> {
+        self.configure_handle(conn)?;
         conn.conn().map_window(self.frame_window)?;
         conn.conn().map_window(self.title_window)?;
-        if !self.shaded {
-            conn.conn().map_window(self.handle_window)?;
-        }
         Ok(())
     }
 
@@ -214,6 +393,40 @@ impl FbWinFrame {
         Ok(())
     }
 
+    fn draw_button(&self, conn: &X11Connection, gc: u32, btn: &FrameButton, fg: u32, bg: u32) -> Result<(), anyhow::Error> {
+        // Background
+        conn.conn().change_gc(gc, &xproto::ChangeGCAux::new().foreground(bg))?;
+        conn.conn().poly_fill_rectangle(
+            self.title_window,
+            gc,
+            &[xproto::Rectangle {
+                x: btn.rect.x,
+                y: btn.rect.y,
+                width: btn.rect.width,
+                height: btn.rect.height,
+            }],
+        )?;
+        // Bevel
+        TextureRender::render_bevel(
+            conn, self.title_window, gc, &btn.rect, self.bevel_width, false, fg, bg,
+        )?;
+        // White border
+        conn.conn().change_gc(gc, &xproto::ChangeGCAux::new().foreground(fg))?;
+        conn.conn().poly_rectangle(
+            self.title_window,
+            gc,
+            &[xproto::Rectangle {
+                x: btn.rect.x,
+                y: btn.rect.y,
+                width: btn.rect.width,
+                height: btn.rect.height,
+            }],
+        )?;
+        // Glyph shape in foreground color
+        btn.draw_glyph(conn, self.title_window, gc)?;
+        Ok(())
+    }
+
     pub fn draw_titlebar(&self, conn: &X11Connection) -> Result<(), anyhow::Error> {
         let gc = match self.gc {
             Some(g) => g,
@@ -231,96 +444,77 @@ impl FbWinFrame {
             self.title_window,
             gc,
             &[xproto::Rectangle {
-                x: 0,
-                y: 0,
+                x: 0, y: 0,
                 width: self.width,
                 height: self.title_height,
             }],
         )?;
 
-        // Bevel highlight along the top/left of the title for a 3D look.
         TextureRender::render_bevel(
-            conn,
-            self.title_window,
-            gc,
+            conn, self.title_window, gc,
             &Rectangle::new(0, 0, self.width, self.title_height),
-            self.bevel_width,
-            true,
-            fg,
-            bg,
+            self.bevel_width, true, fg, bg,
         )?;
 
-        // Window title text, left-aligned and clipped to avoid the close button.
+        let btn_right = self.buttons.last().map(|b| b.rect.right()).unwrap_or(6);
+        let avail = (btn_right - 6).max(4);
         if !self.label.is_empty() {
-            let avail = (self.close_rect.x - 6).max(4);
             let mut disp = self.label.clone();
-            while !disp.is_empty()
-                && self.font.text_width(conn.conn(), &disp).unwrap_or(0) as i16 > avail
-            {
-                disp.pop();
-            }
-            if disp.len() < self.label.len() {
+            let full_w = self.font.text_width(conn.conn(), &disp).unwrap_or(0) as i16;
+            if full_w > avail {
+                let ellipsis_w = self.font.text_width(conn.conn(), "…").unwrap_or(8) as i16;
+                let target = avail.saturating_sub(ellipsis_w);
+                let n = disp.len();
+                let mut lo = 0usize;
+                let mut hi = n;
+                while lo < hi {
+                    let mid = (lo + hi + 1) / 2;
+                    let prefix: String = disp.chars().take(mid).collect();
+                    let w = self.font.text_width(conn.conn(), &prefix).unwrap_or(0) as i16;
+                    if w <= target { lo = mid; } else { hi = mid - 1; }
+                }
+                disp = disp.chars().take(lo).collect();
                 disp.push('…');
             }
             let ty = self.title_height as i16 / 2 + self.font.height() as i16 / 2
                 - self.font.descent() as i16;
-            conn.conn()
-                .change_gc(gc, &xproto::ChangeGCAux::new().foreground(fg))?;
-            self.font
-                .draw_text(conn.conn(), self.title_window, gc, 4, ty, &disp)?;
+            self.font.draw_text_on_bg(conn.conn(), self.title_window, gc, 4, ty, &disp, fg, bg)?;
         }
 
-        // Close button: a small bevelled box with an "x" glyph.
-        conn.conn().change_gc(gc, &xproto::ChangeGCAux::new().foreground(bg))?;
-        conn.conn().poly_fill_rectangle(
-            self.title_window,
-            gc,
-            &[xproto::Rectangle {
-                x: self.close_rect.x,
-                y: self.close_rect.y,
-                width: self.close_rect.width,
-                height: self.close_rect.height,
-            }],
-        )?;
-        TextureRender::render_bevel(
-            conn,
-            self.title_window,
-            gc,
-            &self.close_rect,
-            self.bevel_width,
-            false,
-            fg,
-            bg,
-        )?;
-        let cx = self.close_rect.x
-            + (self.close_rect.width as i16 - self.font.text_width(conn.conn(), "x").unwrap_or(0) as i16)
-                / 2;
-        let cy = self.close_rect.y
-            + (self.close_rect.height as i16 + self.font.height() as i16) / 2
-            - self.font.descent() as i16;
-        conn.conn()
-            .change_gc(gc, &xproto::ChangeGCAux::new().foreground(fg))?;
-        self.font
-            .draw_text(conn.conn(), self.title_window, gc, cx, cy, "x")?;
+        for btn in &self.buttons {
+            self.draw_button(conn, gc, btn, fg, bg)?;
+        }
 
         Ok(())
     }
 
-    /// Update the title-bar label (caller is responsible for redrawing).
     pub fn set_label(&mut self, label: String) {
         self.label = label;
     }
 
-    /// True if the press at (x, y) in title-window coordinates hit the close button.
-    pub fn is_close_press(&self, x: i16, y: i16) -> bool {
-        self.close_rect.contains(x, y)
+    /// Returns which button was pressed, or None.
+    pub fn hit_test_button(&self, x: i16, y: i16) -> Option<ButtonType> {
+        for btn in &self.buttons {
+            if btn.rect.contains(x, y) {
+                return Some(btn.btn_type);
+            }
+        }
+        None
     }
 
-    /// Free the frame's resources. Safe to call once when the window is
-    /// unmanaged; the client itself is reparented back to root by the caller.
+    /// Returns true if the press at (x, y) is on the title bar (not on a button).
+    pub fn is_titlebar_press(&self, x: i16, y: i16) -> bool {
+        y >= 0 && y < self.title_height as i16
+            && x >= 0 && x < self.width as i16
+            && self.hit_test_button(x, y).is_none()
+    }
+
     pub fn destroy(&self, conn: &X11Connection) -> Result<(), anyhow::Error> {
         if let Some(gc) = self.gc {
             conn.conn().free_gc(gc)?;
+        }
+        if let Some(cursor) = self.resize_cursor {
+            let _ = conn.conn().free_cursor(cursor);
         }
         conn.conn().destroy_window(self.title_window)?;
         conn.conn().destroy_window(self.handle_window)?;

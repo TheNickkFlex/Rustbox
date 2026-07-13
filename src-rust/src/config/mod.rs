@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use crate::core::Rectangle;
 
-pub struct FluxboxConfig {
+pub struct RustboxConfig {
     pub init: InitConfig,
     pub keys: KeysConfig,
     pub menu: MenuConfig,
@@ -346,7 +346,7 @@ pub fn parse_init_file<P: AsRef<Path>>(path: P) -> Result<InitConfig, anyhow::Er
 
 pub fn find_config_files(config_dir: &Path) -> Vec<PathBuf> {
     let mut files = Vec::new();
-    let config_dir = config_dir.join("fluxbox");
+    let config_dir = config_dir.join("rustbox");
 
     let entries = [
         "init",

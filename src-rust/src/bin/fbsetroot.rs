@@ -2,10 +2,10 @@
 
 use x11rb::protocol::xproto::{ChangeWindowAttributesAux, ConnectionExt as _, Pixmap};
 
-use fluxbox_rs::core::parse_color;
-use fluxbox_rs::core::Rectangle;
-use fluxbox_rs::render::texture::{GradientType, Texture, TextureRender};
-use fluxbox_rs::x11::X11Connection;
+use rustbox_rs::core::parse_color;
+use rustbox_rs::core::Rectangle;
+use rustbox_rs::render::texture::{GradientType, Texture, TextureRender};
+use rustbox_rs::x11::X11Connection;
 
 fn main() -> Result<(), anyhow::Error> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();

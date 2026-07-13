@@ -26,7 +26,7 @@ impl Default for SlitStyle {
     }
 }
 
-/// A Fluxbox-style slit: a dock container that reparents small "dockapp"
+/// A Rustbox-style slit: a dock container that reparents small "dockapp"
 /// windows (e.g. wmaker/bbpager applets, typically `override_redirect` or
 /// `_NET_WM_WINDOW_TYPE_DOCK`) into a strip at one edge of the screen.
 pub struct FbSlit {
@@ -158,14 +158,23 @@ impl FbSlit {
         Ok(())
     }
 
+    fn is_horizontal(&self) -> bool {
+        matches!(self.style.placement, SlitPlacement::Top | SlitPlacement::Bottom)
+    }
+
     /// Recompute thickness/length and reposition every docked window.
     fn relayout(&mut self, conn: &X11Connection) -> Result<(), anyhow::Error> {
         let gap = self.style.gap;
         let mut thickness: u16 = 0;
         let mut length: u16 = 0;
         for (_w, dw, dh) in &self.dock {
-            thickness = thickness.max(*dw);
-            length = length.saturating_add(*dh).saturating_add(gap);
+            if self.is_horizontal() {
+                thickness = thickness.max(*dh);
+                length = length.saturating_add(*dw).saturating_add(gap);
+            } else {
+                thickness = thickness.max(*dw);
+                length = length.saturating_add(*dh).saturating_add(gap);
+            }
         }
         self.thickness = thickness;
         self.length = length;
@@ -207,21 +216,40 @@ impl FbSlit {
         )?;
         conn.conn().map_window(self.window)?;
 
-        // Restack dock windows from the top/left of the slit inward.
+        // Restack dock windows along the slit's major axis.
         let gap = self.style.gap;
         let mut off: i16 = 0;
-        for (win, _dw, dh) in &self.dock {
-            conn.conn().configure_window(
-                *win,
-                &xproto::ConfigureWindowAux::new()
-                    .x(0)
-                    .y(off as i32)
-                    .stack_mode(xproto::StackMode::ABOVE),
-            )?;
-            off += *dh as i16 + gap as i16;
+        for (win, dw, dh) in &self.dock {
+            if self.is_horizontal() {
+                conn.conn().configure_window(
+                    *win,
+                    &xproto::ConfigureWindowAux::new()
+                        .x(off as i32)
+                        .y(0)
+                        .stack_mode(xproto::StackMode::ABOVE),
+                )?;
+                off += *dw as i16 + gap as i16;
+            } else {
+                conn.conn().configure_window(
+                    *win,
+                    &xproto::ConfigureWindowAux::new()
+                        .x(0)
+                        .y(off as i32)
+                        .stack_mode(xproto::StackMode::ABOVE),
+                )?;
+                off += *dh as i16 + gap as i16;
+            }
         }
         conn.conn().flush()?;
         Ok(())
+    }
+
+    /// Update the stored screen size and refit the slit to it. Called when the
+    /// root window geometry changes (RandR resize).
+    pub fn reconfigure(&mut self, conn: &X11Connection, width: u16, height: u16) -> Result<(), anyhow::Error> {
+        self.screen_width = width;
+        self.screen_height = height;
+        self.reposition(conn)
     }
 
     pub fn handle_expose(&self, conn: &X11Connection) -> Result<(), anyhow::Error> {

@@ -1,6 +1,7 @@
+use x11rb::protocol::randr;
 use x11rb::protocol::xproto::*;
 
-/// High-level, fluxbox-specific event enum. A thin wrapper over the raw
+/// High-level, rustbox-specific event enum. A thin wrapper over the raw
 /// `x11rb::protocol::Event` that only retains the variants we handle, which
 /// keeps the rest of the codebase free of the giant generated event union.
 pub enum Event {
@@ -37,6 +38,8 @@ pub enum Event {
     ColormapNotify(ColormapNotifyEvent),
     ClientMessage(ClientMessageEvent),
     MappingNotify(MappingNotifyEvent),
+    RandRNotify(randr::NotifyEvent),
+    RandRScreenChangeNotify(randr::ScreenChangeNotifyEvent),
     Generic(x11rb::protocol::Event),
 }
 
@@ -76,6 +79,8 @@ impl Event {
             x11rb::protocol::Event::ColormapNotify(e) => Event::ColormapNotify(e),
             x11rb::protocol::Event::ClientMessage(e) => Event::ClientMessage(e),
             x11rb::protocol::Event::MappingNotify(e) => Event::MappingNotify(e),
+            x11rb::protocol::Event::RandrNotify(e) => Event::RandRNotify(e),
+            x11rb::protocol::Event::RandrScreenChangeNotify(e) => Event::RandRScreenChangeNotify(e),
             _ => {
                 return None;
             }

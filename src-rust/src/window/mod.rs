@@ -15,7 +15,7 @@ pub use state::WindowState;
 
 pub type WindowId = u32;
 
-pub struct FluxboxWindow {
+pub struct RustboxWindow {
     id: WindowId,
     client: WinClient,
     frame: FbWinFrame,
@@ -58,7 +58,7 @@ impl Default for NormalHints {
     }
 }
 
-impl FluxboxWindow {
+impl RustboxWindow {
     pub fn new(
         _conn: &X11Connection,
         client: WinClient,
@@ -119,8 +119,67 @@ impl FluxboxWindow {
         &mut self.frame
     }
 
+    pub fn state(&self) -> &WindowState {
+        &self.state
+    }
+
+    pub fn state_mut(&mut self) -> &mut WindowState {
+        &mut self.state
+    }
+
     pub fn geometry(&self) -> &Rectangle {
         &self.geometry
+    }
+
+    pub fn set_geometry(&mut self, geom: Rectangle) {
+        self.geometry = geom;
+    }
+
+    pub fn normal_hints(&self) -> &NormalHints {
+        &self.normal_hints
+    }
+
+    pub fn normal_hints_mut(&mut self) -> &mut NormalHints {
+        &mut self.normal_hints
+    }
+
+    /// Read the client's `WM_NORMAL_HINTS` (min/max size, resize increments,
+    /// aspect ratio, gravity) and merge it into our cached `NormalHints`.
+    /// Called on manage and whenever `WM_NORMAL_HINTS` changes.
+    pub fn update_normal_hints(&mut self, conn: &X11Connection) {
+        use x11rb::properties::WmSizeHints;
+        let wm_normal_hints = conn.atoms().get(crate::x11::Atom::WmNormalHints);
+        let reply = match WmSizeHints::get(conn.conn(), self.client.window(), wm_normal_hints)
+            .ok()
+            .and_then(|c| c.reply().ok())
+        {
+            Some(Some(r)) => r,
+            _ => return,
+        };
+        let h = &mut self.normal_hints;
+        if let Some((mw, mh)) = reply.min_size {
+            h.min_width = mw.max(1) as u16;
+            h.min_height = mh.max(1) as u16;
+        }
+        if let Some((mw, mh)) = reply.max_size {
+            h.max_width = mw.min(u16::MAX as i32) as u16;
+            h.max_height = mh.min(u16::MAX as i32) as u16;
+        }
+        if let Some((wi, hi)) = reply.size_increment {
+            h.width_inc = wi.max(1) as u16;
+            h.height_inc = hi.max(1) as u16;
+        }
+        if let Some((bw, bh)) = reply.base_size {
+            h.base_width = bw.max(0) as u16;
+            h.base_height = bh.max(0) as u16;
+        }
+        if let Some((min_a, max_a)) = reply.aspect {
+            h.min_aspect = min_a.numerator as f64 / min_a.denominator.max(1) as f64;
+            h.max_aspect = max_a.numerator as f64 / max_a.denominator.max(1) as f64;
+        }
+        // `win_gravity` is stored as a raw u32 elsewhere; Gravity has no
+        // primitive cast, so we leave the cached value at its default unless
+        // needed by a future gravity-aware resize.
     }
 
     pub fn workspace(&self) -> u32 {
@@ -173,10 +232,189 @@ impl FluxboxWindow {
         self.frame.destroy(conn)?;
         Ok(())
     }
+
+    // ───────────────────────────────────────────────
+    //  Window operations
+    // ───────────────────────────────────────────────
+
+    pub fn iconify(&mut self, conn: &X11Connection) -> Result<(), anyhow::Error> {
+        if self.state.iconic { return Ok(()); }
+        self.state.iconic = true;
+        self.frame.iconified = true;
+        conn.conn().unmap_window(self.client.window())?;
+        self.frame.hide(conn)?;
+        Ok(())
+    }
+
+    pub fn deiconify(&mut self, conn: &X11Connection) -> Result<(), anyhow::Error> {
+        if !self.state.iconic { return Ok(()); }
+        self.state.iconic = false;
+        self.frame.iconified = false;
+        self.frame.show(conn)?;
+        conn.conn().map_window(self.client.window())?;
+        Ok(())
+    }
+
+    pub fn maximize(&mut self, conn: &X11Connection, vert: bool, horz: bool, wa: &Rectangle) -> Result<(), anyhow::Error> {
+        if self.state.fullscreen || self.state.iconic {
+            return Ok(());
+        }
+        if !self.state.maximized_vert && !self.state.maximized_horz {
+            self.state.save_position(self.geometry);
+        }
+        self.state.maximized_vert = vert;
+        self.state.maximized_horz = horz;
+        self.frame.maximized = vert && horz;
+
+        let new_x = if horz { wa.x } else { self.geometry.x };
+        let new_y = if vert { wa.y } else { self.geometry.y };
+        let new_w = if horz { wa.width } else { self.geometry.width };
+        let new_h = if vert { wa.height } else { self.geometry.height };
+
+        self.frame.move_resize(conn, new_x, new_y, new_w, new_h)?;
+        self.reconfigure_client(conn, new_w, new_h)?;
+        self.geometry = Rectangle::new(new_x, new_y, new_w, new_h);
+        Ok(())
+    }
+
+    pub fn unmaximize(&mut self, conn: &X11Connection) -> Result<(), anyhow::Error> {
+        if !self.state.maximized_vert && !self.state.maximized_horz {
+            return Ok(());
+        }
+        self.state.maximized_vert = false;
+        self.state.maximized_horz = false;
+        self.frame.maximized = false;
+
+        if let Some(r) = self.state.restore_position() {
+            self.frame.move_resize(conn, r.x, r.y, r.width, r.height)?;
+            self.reconfigure_client(conn, r.width, r.height)?;
+            self.geometry = r;
+        }
+        Ok(())
+    }
+
+    pub fn reconfigure_client(&self, conn: &X11Connection, w: u16, h: u16) -> Result<(), anyhow::Error> {
+        use x11rb::protocol::xproto::ConfigureWindowAux;
+        let bw = self.frame.border_width();
+        let th = self.frame.title_height();
+        conn.conn().configure_window(
+            self.client.window(),
+            &ConfigureWindowAux::new()
+                .x(bw as i32)
+                .y((bw + th) as i32)
+                .width(w as u32)
+                .height(h as u32),
+        )?;
+        Ok(())
+    }
+
+    pub fn set_fullscreen(&mut self, conn: &X11Connection, fs: bool, root_w: u16, root_h: u16) -> Result<(), anyhow::Error> {
+        use x11rb::protocol::xproto::ConfigureWindowAux;
+        if fs == self.state.fullscreen { return Ok(()); }
+        self.state.fullscreen = fs;
+        let bw = self.frame.border_width();
+        let th = self.frame.title_height();
+        if fs {
+            if !self.state.maximized_vert && !self.state.maximized_horz {
+                self.state.save_position(self.geometry);
+            }
+            // Move frame to (0,0) and fill entire screen
+            conn.conn().configure_window(
+                self.frame.frame_window(),
+                &ConfigureWindowAux::new()
+                    .x(0).y(0)
+                    .width(root_w as u32)
+                    .height(root_h as u32),
+            )?;
+            // Position client at (0,0) inside frame, fill it
+            conn.conn().configure_window(
+                self.client.window(),
+                &ConfigureWindowAux::new()
+                    .x(0).y(0)
+                    .width(root_w as u32)
+                    .height(root_h as u32),
+            )?;
+            // Hide decorations
+            conn.conn().unmap_window(self.frame.title_window())?;
+            conn.conn().unmap_window(self.frame.handle_window())?;
+            self.geometry = Rectangle::new(0, 0, root_w, root_h);
+        } else {
+            // Show decorations
+            let _ = conn.conn().map_window(self.frame.title_window());
+            if !self.is_shaded() {
+                let _ = conn.conn().map_window(self.frame.handle_window());
+            }
+            if let Some(r) = self.state.restore_position() {
+                // Restore frame
+                conn.conn().configure_window(
+                    self.frame.frame_window(),
+                    &ConfigureWindowAux::new()
+                        .x(r.x as i32).y(r.y as i32)
+                        .width(r.width as u32)
+                        .height((r.height + th + bw * 2) as u32),
+                )?;
+                // Restore client inside frame (offset by border + title)
+                conn.conn().configure_window(
+                    self.client.window(),
+                    &ConfigureWindowAux::new()
+                        .x(bw as i32).y((bw + th) as i32)
+                        .width(r.width as u32)
+                        .height(r.height as u32),
+                )?;
+                // Update title bar
+                conn.conn().configure_window(
+                    self.frame.title_window(),
+                    &ConfigureWindowAux::new().width(r.width as u32),
+                )?;
+                self.frame.draw_titlebar(conn)?;
+                self.geometry = r;
+            }
+        }
+        self.send_configure_notify(conn)?;
+        Ok(())
+    }
+
+    /// Move the frame to (x, y) with optional resize.
+    pub fn move_resize(
+        &mut self,
+        conn: &X11Connection,
+        x: i16, y: i16,
+        w: u16, h: u16,
+    ) -> Result<(), anyhow::Error> {
+        self.geometry = Rectangle::new(x, y, w, h);
+        self.frame.move_resize(conn, x, y, w, h)?;
+        self.send_configure_notify(conn)?;
+        Ok(())
+    }
+
+    pub fn move_to(&self, conn: &X11Connection, x: i16, y: i16) -> Result<(), anyhow::Error> {
+        self.frame.move_to(conn, x, y)?;
+        Ok(())
+    }
+
+    fn send_configure_notify(&self, conn: &X11Connection) -> Result<(), anyhow::Error> {
+        use x11rb::protocol::xproto::ConfigureNotifyEvent;
+        let bw = self.frame.border_width();
+        let ev = ConfigureNotifyEvent {
+            response_type: x11rb::protocol::xproto::CONFIGURE_NOTIFY_EVENT,
+            sequence: 0,
+            event: self.client.window(),
+            window: self.client.window(),
+            above_sibling: x11rb::NONE,
+            x: (self.geometry.x + bw as i16) as i16,
+            y: (self.geometry.y + bw as i16 + self.frame.title_height() as i16) as i16,
+            width: self.geometry.width,
+            height: self.geometry.height,
+            border_width: bw,
+            override_redirect: false,
+        };
+        conn.conn().send_event(false, self.client.window(), x11rb::protocol::xproto::EventMask::NO_EVENT, ev)?;
+        Ok(())
+    }
 }
 
 pub struct WindowManager {
-    windows: HashMap<WindowId, FluxboxWindow>,
+    windows: HashMap<WindowId, RustboxWindow>,
     focus_order: Vec<WindowId>,
     stacking_order: Vec<WindowId>,
     last_focused: Option<WindowId>,
@@ -194,7 +432,7 @@ impl WindowManager {
         }
     }
 
-    pub fn add_window(&mut self, window: FluxboxWindow) {
+    pub fn add_window(&mut self, window: RustboxWindow) {
         let id = window.id();
         self.windows.insert(id, window);
         self.stacking_order.push(id);
@@ -212,11 +450,11 @@ impl WindowManager {
         }
     }
 
-    pub fn get_window(&self, id: WindowId) -> Option<&FluxboxWindow> {
+    pub fn get_window(&self, id: WindowId) -> Option<&RustboxWindow> {
         self.windows.get(&id)
     }
 
-    pub fn get_window_mut(&mut self, id: WindowId) -> Option<&mut FluxboxWindow> {
+    pub fn get_window_mut(&mut self, id: WindowId) -> Option<&mut RustboxWindow> {
         self.windows.get_mut(&id)
     }
 
@@ -235,11 +473,11 @@ impl WindowManager {
         }
     }
 
-    pub fn windows(&self) -> impl Iterator<Item = &FluxboxWindow> {
+    pub fn windows(&self) -> impl Iterator<Item = &RustboxWindow> {
         self.windows.values()
     }
 
-    pub fn windows_mut(&mut self) -> impl Iterator<Item = &mut FluxboxWindow> {
+    pub fn windows_mut(&mut self) -> impl Iterator<Item = &mut RustboxWindow> {
         self.windows.values_mut()
     }
 
@@ -247,7 +485,7 @@ impl WindowManager {
         self.windows.len()
     }
 
-    pub fn iter_by_stacking(&self) -> impl Iterator<Item = &FluxboxWindow> {
+    pub fn iter_by_stacking(&self) -> impl Iterator<Item = &RustboxWindow> {
         self.stacking_order.iter().filter_map(|id| self.windows.get(id))
     }
 }

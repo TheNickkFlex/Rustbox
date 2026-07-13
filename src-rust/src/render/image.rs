@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -63,6 +63,30 @@ impl Image {
         Ok(pixmap)
     }
 
+    /// Build an `Image` from a SNI `IconPixmap` buffer.
+    ///
+    /// The D-Bus `IconPixmap` format is ARGB32: 4 bytes per pixel in the order
+    /// `A, R, G, B`. We reorder to the RGBA8 layout used everywhere else so the
+    /// existing `create_pixmap`/`scale` paths work unchanged.
+    pub fn from_argb32(width: u32, height: u32, argb: &[u8]) -> Result<Self, anyhow::Error> {
+        let expected = width as usize * height as usize * 4;
+        if argb.len() != expected {
+            return Err(anyhow::anyhow!(
+                "SNI: IconPixmap com tamanho inválido (esperado {expected} bytes, obteve {})",
+                argb.len()
+            ));
+        }
+        let mut data = Vec::with_capacity(expected);
+        for chunk in argb.chunks(4) {
+            let (a, r, g, b) = (chunk[0], chunk[1], chunk[2], chunk[3]);
+            data.push(r);
+            data.push(g);
+            data.push(b);
+            data.push(a);
+        }
+        Ok(Self { width, height, data })
+    }
+
     pub fn scale(&self, width: u32, height: u32) -> Result<Self, anyhow::Error> {
         let img = DynamicImage::ImageRgba8(
             image::RgbaImage::from_raw(self.width, self.height, self.data.clone())
@@ -77,35 +101,80 @@ impl Image {
 
 pub struct ImageControl {
     cache: HashMap<String, Arc<Image>>,
+    /// Insertion order used for FIFO/LRU eviction. The front is the oldest
+    /// entry; when the cache is full we evict from the front rather than
+    /// picking an arbitrary `HashMap` slot.
+    order: VecDeque<String>,
     max_size: usize,
 }
 
 impl ImageControl {
     pub fn new(max_size: usize) -> Self {
-        Self { cache: HashMap::new(), max_size }
+        Self {
+            cache: HashMap::new(),
+            order: VecDeque::new(),
+            max_size,
+        }
     }
 
     pub fn load(&mut self, path: &str) -> Result<Arc<Image>, anyhow::Error> {
         if let Some(cached) = self.cache.get(path) {
+            // Touch: move to the back so recently used entries survive eviction.
+            if let Some(pos) = self.order.iter().position(|k| k == path) {
+                let key = self.order.remove(pos).unwrap();
+                self.order.push_back(key);
+            }
             return Ok(cached.clone());
         }
 
         if self.cache.len() >= self.max_size {
-            if let Some(key) = self.cache.keys().next().cloned() {
-                self.cache.remove(&key);
+            if let Some(oldest) = self.order.pop_front() {
+                self.cache.remove(&oldest);
             }
         }
 
         let image = Arc::new(Image::from_file(path)?);
         self.cache.insert(path.to_string(), image.clone());
+        self.order.push_back(path.to_string());
         Ok(image)
+    }
+
+    /// Load an image from raw in-memory bytes (e.g. the `image-data` hint).
+    /// Not cached (callers pass few, unique payloads).
+    pub fn load_memory(&mut self, data: &[u8]) -> Result<Arc<Image>, anyhow::Error> {
+        Ok(Arc::new(Image::from_memory(data)?))
     }
 
     pub fn clear(&mut self) {
         self.cache.clear();
+        self.order.clear();
     }
 
     pub fn remove(&mut self, path: &str) {
         self.cache.remove(path);
+        if let Some(pos) = self.order.iter().position(|k| k == path) {
+            self.order.remove(pos);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn from_argb32_reorders_to_rgba() {
+        // One pixel: ARGB = (0xAA, 0x12, 0x34, 0x56) -> RGBA = (0x12, 0x34, 0x56, 0xAA)
+        let argb = [0xAA, 0x12, 0x34, 0x56];
+        let img = Image::from_argb32(1, 1, &argb).unwrap();
+        assert_eq!(img.data, vec![0x12, 0x34, 0x56, 0xAA]);
+        assert_eq!(img.width, 1);
+        assert_eq!(img.height, 1);
+    }
+
+    #[test]
+    fn from_argb32_rejects_short_buffer() {
+        let argb = [0u8; 7];
+        assert!(Image::from_argb32(2, 1, &argb).is_err());
     }
 }

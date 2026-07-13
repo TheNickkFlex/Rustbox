@@ -1,9 +1,9 @@
 [package]
-name = "fluxbox-rs"
+name = "rustbox-rs"
 version = "1.4.0"
 edition = "2021"
-description = "Fluxbox window manager - Rust port"
-authors = ["Fluxbox Team <fluxbox@lists.sourceforge.net>"]
+description = "Rustbox window manager"
+authors = ["Rustbox Team <rustbox@lists.sourceforge.net>"]
 license = "MIT"
 
 [features]
@@ -13,7 +13,7 @@ xinerama = ["x11rb/xinerama"]
 xrandr = ["x11rb/randr"]
 xshape = ["x11rb/shape"]
 composite = ["x11rb/composite", "x11rb/damage"]
-freetype2 = ["ttf-parser"]
+freetype2 = []
 fribidi = ["unicode-bidi"]
 debug = []
 profiling = []
@@ -40,8 +40,11 @@ serde_json = "1"
 # Image loading
 image = "0.25"
 
-# Font rendering (optional, uses X11 core fonts by default)
-ttf-parser = { version = "0.25", optional = true }
+# Font rendering (TrueType outline rasterization + emoji)
+ttf-parser = "0.25"
+fontdb = "0.21"
+ab_glyph = "0.2"
+skrifa = "0.44"
 
 # Unicode support
 unicode-bidi = { version = "0.3", optional = true }
@@ -55,12 +58,28 @@ glob-match = "0.2"
 # Signal handling
 signal-hook = "0.3"
 
+# Timezone support (localtime_r)
+libc = "0.2"
+
+# D-Bus (notification daemon / StatusNotifierHost)
+dbus = "0.9"
+
+# D-Bus (pure-Rust, async) for StatusNotifierItem (modern tray apps)
+zbus = { version = "5", default-features = false, features = ["async-io"] }
+
+# Lightweight async executor used by the SNI D-Bus thread (zbus async-io backend)
+smol = "2"
+
+# Stream utilities for the per-item SNI watch tasks (NewIcon / PropertiesChanged)
+futures-util = "0.3"
+
+# Terminal emulator: kitty (external binary, not a crate dependency)
+
 [profile.release]
 lto = true
 codegen-units = 1
 opt-level = 3
 strip = "symbols"
-panic = "abort"
 
 [profile.bench]
 lto = true
@@ -68,5 +87,5 @@ codegen-units = 1
 opt-level = 3
 
 [[bin]]
-name = "fluxbox"
+name = "rustbox"
 path = "src/main.rs"

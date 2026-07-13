@@ -13,23 +13,26 @@ pub struct X11Connection {
     conn: Arc<RustConnection>,
     screen_num: usize,
     atoms: AtomCache,
+    display_name: String,
 }
 
 impl X11Connection {
     pub fn connect() -> Result<Self, anyhow::Error> {
+        let display_name = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".to_string());
         let (conn, screen_num) = x11rb::connect(None)?;
         let conn = Arc::new(conn);
 
         let mut atoms = AtomCache::new();
         atoms.init(&*conn)?;
 
-        Ok(Self { conn, screen_num, atoms })
+        Ok(Self { conn, screen_num, atoms, display_name })
     }
 
     /// Connect to an explicit Unix socket path. Needed on systems (e.g. Termux)
     /// where the X socket does not live under the conventional `/tmp/.X11-unix`.
     #[cfg(unix)]
     pub fn connect_to_socket(path: &str) -> Result<Self, anyhow::Error> {
+        let display_name = display_from_socket(path);
         let stream = UnixStream::connect(path)
             .map_err(|e| anyhow::anyhow!("Failed to connect to X socket {}: {}", path, e))?;
         let (default_stream, _peer) = DefaultStream::from_unix_stream(stream)?;
@@ -40,7 +43,7 @@ impl X11Connection {
         let mut atoms = AtomCache::new();
         atoms.init(&*conn)?;
 
-        Ok(Self { conn, screen_num, atoms })
+        Ok(Self { conn, screen_num, atoms, display_name })
     }
 
     /// Connect honouring optional explicit display/socket overrides. The
@@ -76,6 +79,13 @@ impl X11Connection {
         self.screen().root
     }
 
+    /// The X display this connection is attached to (e.g. `:1`). Used when
+    /// spawning external applications so they open on the same display the WM
+    /// manages rather than falling back to the ambient `DISPLAY`.
+    pub fn display_name(&self) -> &str {
+        &self.display_name
+    }
+
     pub fn atoms(&self) -> &AtomCache {
         &self.atoms
     }
@@ -83,5 +93,19 @@ impl X11Connection {
     pub fn flush(&self) -> Result<(), anyhow::Error> {
         self.conn.flush()?;
         Ok(())
+    }
+}
+
+/// Derive an X display string (e.g. `:1`) from a Unix socket path such as
+/// `/tmp/.X11-unix/X1` or `/data/.../usr/tmp/.X11-unix/X1`.
+fn display_from_socket(path: &str) -> String {
+    let name = std::path::Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("X0");
+    if let Some(rest) = name.strip_prefix('X') {
+        format!(":{}", rest)
+    } else {
+        ":0".to_string()
     }
 }

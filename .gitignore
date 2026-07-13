@@ -1,0 +1,53 @@
+# Wildcard + in any subdir.
+*.o
+
+# Exact filename in any subdir.
+.deps
+.dirstamp
+Makefile
+Makefile.in
+
+# Exact wildcard, e.g., not in subdirs.
+/doc/*.1
+/doc/*.5
+/doc/*/*.1
+/doc/*/*.5
+/nls/*/*.cat
+/nls/*/generated-*.m
+/m4/*.m4
+
+# Exact match, if a directory then everything in directory.
+/aclocal.m4
+/autom4te.cache/
+/build-aux/
+/config.h
+/config.h.in
+/config.log
+/config.status
+/configure
+/data/apps
+/data/init
+/data/menu
+/fbrun
+/fbsetroot
+/fluxbox
+/fluxbox-remote
+/fluxbox-update_configs
+/libFbTk.a
+/src/defaults.cc
+/src/defaults.hh
+/stamp-h1
+/testDemandAttention
+/testFont
+/testFullscreen
+/testKeys
+/testRectangleUtil
+/testSignals
+/testStringUtil
+/testTexture
+/util/fluxbox-generate_menu
+/util/startfluxbox
+/version.h
+
+# off source build directory
+build

@@ -13,8 +13,8 @@ use x11rb::protocol::Event;
 use x11rb::rust_connection::RustConnection;
 use x11rb::CURRENT_TIME;
 
-use fluxbox_rs::render::font::Font;
-use fluxbox_rs::x11::X11Connection;
+use rustbox_rs::render::font::Font;
+use rustbox_rs::x11::X11Connection;
 
 fn main() -> Result<(), anyhow::Error> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
@@ -71,7 +71,7 @@ fn main() -> Result<(), anyhow::Error> {
     )?;
     conn.conn().map_window(win)?;
 
-    let font = Font::load_x11_font(conn.conn(), "fixed").unwrap_or_else(|_| Font::new("fixed"));
+    let font = Font::new("fixed");
     let gc = conn.conn().generate_id()?;
     conn.conn().create_gc(
         gc,
@@ -140,21 +140,19 @@ fn draw(
     win: u32,
     gc: u32,
     font: &Font,
-    _bg: u32,
+    bg: u32,
     fg: u32,
     h: u16,
     input: &str,
     prompt: &str,
 ) -> Result<(), anyhow::Error> {
-    let rust: &RustConnection = conn.conn();
-    rust.clear_area(true, win, 0, 0, 0, 0)?;
-    rust.change_gc(gc, &xproto::ChangeGCAux::new().foreground(fg).font(font.x_id()))?;
+    conn.conn().clear_area(true, win, 0, 0, 0, 0)?;
 
     let baseline = (h as i16 + font.height() as i16) / 2 - font.descent() as i16;
-    font.draw_text(rust, win, gc, 4, baseline, prompt)?;
-    let px = 4 + font.text_width(rust, prompt)? as i16 + 6;
-    font.draw_text(rust, win, gc, px, baseline, input)?;
-    rust.flush()?;
+    font.draw_text_on_bg(conn.conn(), win, gc, 4, baseline, prompt, fg, bg)?;
+    let px = 4 + font.text_width(conn.conn(), prompt)? as i16 + 6;
+    font.draw_text_on_bg(conn.conn(), win, gc, px, baseline, input, fg, bg)?;
+    conn.conn().flush()?;
     Ok(())
 }
 

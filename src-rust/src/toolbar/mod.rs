@@ -38,7 +38,7 @@ impl Default for ToolbarStyle {
     }
 }
 
-/// A Fluxbox-style toolbar: a docked bar with workspace buttons on the left,
+/// A Rustbox-style toolbar: a docked bar with workspace buttons on the left,
 /// the focused window label in the center, and a clock on the right. Owned by
 /// `BScreen`; it is an `override_redirect` window so it never participates in
 /// normal window management.
@@ -59,6 +59,9 @@ pub struct FbToolbar {
     clock_rect: Rectangle,
     window_items: Vec<(String, bool)>,
     window_rects: Vec<Rectangle>,
+    /// Width (px) reserved on the right of the toolbar for the system tray,
+    /// which sits immediately to the left of the clock. Updated by `BScreen`.
+    tray_reserve: i16,
 }
 
 impl FbToolbar {
@@ -74,13 +77,18 @@ impl FbToolbar {
             ..ToolbarStyle::default()
         };
 
+        let y = match placement {
+            ToolbarPlacement::Top => 0,
+            ToolbarPlacement::Bottom => screen_height.saturating_sub(style.height) as i16,
+        };
+
         let window = conn.conn().generate_id()?;
         conn.conn().create_window(
             0,
             window,
             conn.root_window(),
             0,
-            0,
+            y,
             screen_width,
             style.height,
             style.border_width,
@@ -101,8 +109,7 @@ impl FbToolbar {
             &xproto::CreateGCAux::new().foreground(conn.screen().black_pixel),
         )?;
 
-        let font = Font::load_x11_font(conn.conn(), &style.font)
-            .unwrap_or_else(|_| Font::new(&style.font));
+        let font = Font::new(&style.font);
         log::debug!("toolbar font x_id present: {}", font.x_id().is_some());
 
         let mut tb = Self {
@@ -122,6 +129,7 @@ impl FbToolbar {
             clock_rect: Rectangle::zero(),
             window_items: Vec::new(),
             window_rects: Vec::new(),
+            tray_reserve: 0,
         };
         tb.layout();
         Ok(tb)
@@ -133,6 +141,16 @@ impl FbToolbar {
 
     pub fn show(&self, conn: &X11Connection) -> Result<(), anyhow::Error> {
         conn.conn().map_window(self.window)?;
+        conn.conn().configure_window(
+            self.window,
+            &xproto::ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
+        )?;
+        Ok(())
+    }
+
+    /// Re-raise the toolbar above all other windows so it never gets covered
+    /// by a maximized window.
+    pub fn raise(&self, conn: &X11Connection) -> Result<(), anyhow::Error> {
         conn.conn().configure_window(
             self.window,
             &xproto::ConfigureWindowAux::new().stack_mode(xproto::StackMode::ABOVE),
@@ -152,6 +170,26 @@ impl FbToolbar {
 
     pub fn set_current_workspace(&mut self, ws: u32) {
         self.current_workspace = ws;
+    }
+
+    pub fn set_workspace_names(&mut self, names: Vec<String>) {
+        self.workspace_names = names;
+    }
+
+    /// Width the system tray currently occupies on the right, next to the
+    /// clock. The toolbar stops its window-list before this region so the
+    /// tray icons never overlap a window button.
+    pub fn set_tray_reserve(&mut self, width: i16) {
+        self.tray_reserve = width.max(0);
+    }
+
+    /// Screen-x of the tray's right edge (i.e. the left edge of the clock
+    /// minus a gap). The tray anchors itself so its right edge lands here.
+    pub fn tray_right_anchor(&self) -> i16 {
+        let bw = self.style.border_width as i16;
+        let clock_w: i16 = 144;
+        let gap: i16 = 2;
+        (self.screen_width as i16) - clock_w - 2 * gap - bw
     }
 
     pub fn set_label(&mut self, label: String) {
@@ -196,7 +234,10 @@ impl FbToolbar {
 
         let clock_x = (self.screen_width as i16).saturating_sub(clock_w + gap + bw);
         let list_x = x;
-        let list_w = (clock_x - gap - list_x).max(0) as i16;
+        // Reserve room for the tray (to the left of the clock) so window
+        // buttons never grow under the tray icons.
+        let list_right = (self.tray_right_anchor() - self.tray_reserve - gap).max(list_x);
+        let list_w = (list_right - list_x).max(0) as i16;
 
         self.window_rects.clear();
         if !self.window_items.is_empty() {
@@ -278,7 +319,8 @@ impl FbToolbar {
             )?;
 
             let text = format!("{}", i + 1);
-            self.draw_text(conn, rect, &text, crate::core::Align::Center, if current { white } else { black })?;
+            let (fg, bg) = if current { (white, black) } else { (black, white) };
+            self.draw_text(conn, rect, &text, crate::core::Align::Center, fg, bg)?;
         }
 
         // Running-window list in the centre (the "taskbar").
@@ -310,36 +352,47 @@ impl FbToolbar {
                     black,
                 )?;
 
-                // Clip the label to the button width.
                 let avail = (rect.width as i16 - 6).max(4);
                 let mut disp = name.clone();
-                while !disp.is_empty()
-                    && self.font.text_width(conn.conn(), &disp).unwrap_or(0) as i16 > avail
-                {
-                    disp.pop();
-                }
-                if disp.len() < name.len() {
+                let full_w = self.font.text_width(conn.conn(), &disp).unwrap_or(0) as i16;
+                if full_w > avail {
+                    let ellipsis_w = self.font.text_width(conn.conn(), "…").unwrap_or(8) as i16;
+                    let target = avail.saturating_sub(ellipsis_w);
+                    let n = disp.len();
+                    let mut lo = 0usize;
+                    let mut hi = n;
+                    while lo < hi {
+                        let mid = (lo + hi + 1) / 2;
+                        let prefix: String = disp.chars().take(mid).collect();
+                        let w = self.font.text_width(conn.conn(), &prefix).unwrap_or(0) as i16;
+                        if w <= target { lo = mid; } else { hi = mid - 1; }
+                    }
+                    disp = disp.chars().take(lo).collect();
                     disp.push('…');
                 }
                 let ty = rect.y
                     + (rect.height as i16 + self.font.height() as i16) / 2
                     - self.font.descent() as i16;
-                conn.conn().change_gc(
-                    self.gc,
-                    &xproto::ChangeGCAux::new()
-                        .foreground(if *focused { white } else { black }),
-                )?;
-                self.font.draw_text(conn.conn(), self.window, self.gc, rect.x + 3, ty, &disp)?;
+                let (fg, bg) = if *focused { (white, black) } else { (black, white) };
+                self.font.draw_text_on_bg(conn.conn(), self.window, self.gc, rect.x + 3, ty, &disp, fg, bg)?;
             }
         } else if !self.label.is_empty() {
-            self.draw_text(conn, &self.label_rect, &self.label, crate::core::Align::Left, black)?;
+            self.draw_text(conn, &self.label_rect, &self.label, crate::core::Align::Left, black, white)?;
         }
 
         // Clock on the right.
         let clock = current_clock();
-        self.draw_text(conn, &self.clock_rect, &clock, crate::core::Align::Right, black)?;
+        self.draw_text(conn, &self.clock_rect, &clock, crate::core::Align::Right, black, white)?;
 
         Ok(())
+    }
+
+    /// Update the stored screen size and refit the toolbar to it. Called when
+    /// the root window geometry changes (RandR resize).
+    pub fn reconfigure(&mut self, conn: &X11Connection, width: u16, height: u16) -> Result<(), anyhow::Error> {
+        self.screen_width = width;
+        self.screen_height = height;
+        self.render(conn)
     }
 
     pub fn handle_expose(&mut self, conn: &X11Connection) -> Result<(), anyhow::Error> {
@@ -367,6 +420,7 @@ impl FbToolbar {
         text: &str,
         align: crate::core::Align,
         fg: u32,
+        bg: u32,
     ) -> Result<(), anyhow::Error> {
         let font = &self.font;
         let tw = font.text_width(conn.conn(), text).unwrap_or(0) as i16;
@@ -383,14 +437,9 @@ impl FbToolbar {
         };
         let ty = rect.y + (rect.height as i16 + fh) / 2 - font.descent() as i16;
 
-        log::debug!("draw_text '{}' at ({},{}) fg={} x_id={:?}", text, tx, ty, fg, font.x_id());
+        log::debug!("draw_text '{}' at ({},{}) fg={} bg={}", text, tx, ty, fg, bg);
 
-        conn.conn().change_gc(
-            self.gc,
-            &xproto::ChangeGCAux::new()
-                .foreground(fg),
-        )?;
-        font.draw_text(conn.conn(), self.window, self.gc, tx, ty, text)?;
+        font.draw_text_on_bg(conn.conn(), self.window, self.gc, tx, ty, text, fg, bg)?;
         Ok(())
     }
 
@@ -401,15 +450,16 @@ impl FbToolbar {
     }
 }
 
-/// Format the current UTC time as HH:MM:SS without any external dependency.
+/// Format the current local time as HH:MM:SS using the system timezone.
 fn current_clock() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let h = (secs / 3600) % 24;
-    let m = (secs / 60) % 60;
-    let s = secs % 60;
-    format!("{:02}:{:02}:{:02}", h, m, s)
+        .unwrap_or(0) as libc::time_t;
+
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&secs, &mut tm);
+        format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+    }
 }
