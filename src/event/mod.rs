@@ -44,7 +44,7 @@ impl Rustbox {
 
         rustbox.init_screens()?;
         log::info!("Rustbox::new: init_screens ok");
-        rustbox.notify = NotifyDaemon::new(&rustbox.conn);
+        rustbox.notify = Some(NotifyDaemon::new(&rustbox.conn));
         log::info!("Rustbox::new: notify ok");
         match SniManager::new() {
             Ok(sni) => {
@@ -476,6 +476,7 @@ impl Rustbox {
                 let conn = &self.conn;
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     n.process_dbus(conn);
+                    n.process_internal(conn);
                     n.tick(conn);
                 }));
                 if let Err(payload) = res {
