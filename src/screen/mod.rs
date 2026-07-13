@@ -857,6 +857,13 @@ impl BScreen {
         let mut fbwin = fbwin;
         fbwin.set_geometry(crate::core::Rectangle::new(geom.x, geom.y, geom.width, geom.height));
         fbwin.update_normal_hints(&self.conn);
+        // Some apps (e.g. kitty with a saved session) (re)open already
+        // maximized. The WM has no "before" geometry in that case, so flag it
+        // as maximized on manage and let maximize() stash a sane restore point.
+        // This prevents the window from being stuck maximized forever.
+        if RustboxWindow::covers_workarea(*fbwin.geometry(), &self.workarea) {
+            let _ = fbwin.maximize(&self.conn, true, true, &self.workarea);
+        }
         self.add_window(fbwin, self.current_workspace);
 
         self.update_toolbar();
@@ -1554,11 +1561,10 @@ impl BScreen {
                                     crate::window::frame::ButtonType::Maximize => {
                                         if w.is_fullscreen() {
                                             let _ = w.set_fullscreen(&self.conn, false, self.root_width, self.root_height);
-                                        } else if w.is_maximized() {
-                                            let _ = w.unmaximize(&self.conn);
+                                        } else if w.is_maximized() || RustboxWindow::covers_workarea(*w.geometry(), &self.workarea) {
+                                            let _ = w.unmaximize(&self.conn, &self.workarea);
                                         } else {
-                                            let wa = self.workarea;
-                                            let _ = w.maximize(&self.conn, true, true, &wa);
+                                            let _ = w.maximize(&self.conn, true, true, &self.workarea);
                                         }
                                         let _ = w.redraw_title(&self.conn);
                                         let _ = self.toolbar.raise(&self.conn);
@@ -2389,7 +2395,7 @@ impl BScreen {
                 if let Some(active) = self.window_manager.active_window() {
                     if let Some(w) = self.window_manager.get_window_mut(active) {
                         if w.is_maximized() {
-                            let _ = w.unmaximize(&self.conn);
+                            let _ = w.unmaximize(&self.conn, &self.workarea);
                         } else {
                             let _ = w.maximize(&self.conn, true, true, &self.workarea);
                         }
