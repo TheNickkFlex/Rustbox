@@ -30,6 +30,19 @@ running.
 - **Built-in notifications.** `org.freedesktop.Notifications` + dunstctl,
   rules, markup, icons, progress bars, stack tags — all inside the WM.
 
+## Resource usage
+
+Average footprint of the release build measured **idle** (no managed windows)
+on a virtual X server (Xephyr, 1024×768). VRAM is the X server-side footprint
+(windows, pixmaps, GCs) — read from the X server process, since all server
+resources live there.
+
+| Resource | Average (idle) | Notes                                                                             |
+|----------|----------------|-----------------------------------------------------------------------------------|
+| RAM      | ~29 MB (RSS)   | Stable; no leak over 10 s. Dominated by the font DB + emoji font loaded at startup. |
+| CPU      | ~0.6 %         | Event loop blocks while idle; essentially idle.                                   |
+| VRAM     | ~0.15 MB       | Root + toolbar + tray windows and GCs. Grows only with notifications (≈4 KB icon pixmap each) and managed window frames. |
+
 ## Features
 
 | Area              | What's working                                              |
