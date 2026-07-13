@@ -2,17 +2,9 @@
 
 A fluxbox-based window manager written entirely in **Rust** (X11).
 
-## **BIG UPDATE COMING SOON**
+## Beta Stable Preview
 
-**• A lot of bugs and leaks solved**
-
-**• More performance, better appearance**
-
-*MUCH MORE COMING SOON!, HOOOPEE*
-
-## Alpha Preview
-
-![Rustbox in action](screenshot-alpha2.1.png)
+![Rustbox in action](screenshotbeta.png)
 
 ## What is Rustbox?
 
