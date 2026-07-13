@@ -214,6 +214,35 @@ impl RustboxWindow {
         self.state.maximized_vert || self.state.maximized_horz
     }
 
+    /// True when `rect` already fills (or exceeds) the workarea in both
+    /// dimensions, i.e. the window is already maximized-looking and there is
+    /// no smaller "normal" geometry to restore to. Matches both workarea-sized
+    /// windows and larger (root-sized) ones that apps open maximized into.
+    pub fn covers_workarea(rect: Rectangle, wa: &Rectangle) -> bool {
+        let slack = 4i16;
+        let right = rect.x + rect.width as i16;
+        let bottom = rect.y + rect.height as i16;
+        let wa_right = wa.x + wa.width as i16;
+        let wa_bottom = wa.y + wa.height as i16;
+        // Window spans at least the workarea horizontally and vertically
+        // (allowing it to be larger — e.g. full-root maximized windows).
+        rect.x <= wa.x + slack
+            && rect.y <= wa.y + slack
+            && right >= wa_right - slack
+            && bottom >= wa_bottom - slack
+    }
+
+    /// A sensible centered "normal" window size used as a fallback restore
+    /// point when a window was already maximized when managed (so the app
+    /// never reopens stuck in the maximized state).
+    pub fn default_normal_rect(wa: &Rectangle) -> Rectangle {
+        let w = (wa.width as f32 * 0.6) as u16;
+        let h = (wa.height as f32 * 0.6) as u16;
+        let x = wa.x + ((wa.width - w) / 2) as i16;
+        let y = wa.y + ((wa.height - h) / 2) as i16;
+        Rectangle::new(x, y, w, h)
+    }
+
     pub fn is_fullscreen(&self) -> bool {
         self.state.fullscreen
     }
@@ -260,7 +289,16 @@ impl RustboxWindow {
             return Ok(());
         }
         if !self.state.maximized_vert && !self.state.maximized_horz {
-            self.state.save_position(self.geometry);
+            // Only remember the current geometry as the restore point if the
+            // window is NOT already filling the workarea. Apps that reopen
+            // maximized (e.g. kitty remembering its session) come up already
+            // at full workarea size; saving that as the restore rect would make
+            // un-maximize a no-op and trap the user in the maximized state.
+            if !Self::covers_workarea(self.geometry, wa) {
+                self.state.save_position(self.geometry);
+            } else {
+                self.state.save_position(Self::default_normal_rect(wa));
+            }
         }
         self.state.maximized_vert = vert;
         self.state.maximized_horz = horz;
@@ -277,7 +315,7 @@ impl RustboxWindow {
         Ok(())
     }
 
-    pub fn unmaximize(&mut self, conn: &X11Connection) -> Result<(), anyhow::Error> {
+    pub fn unmaximize(&mut self, conn: &X11Connection, wa: &Rectangle) -> Result<(), anyhow::Error> {
         if !self.state.maximized_vert && !self.state.maximized_horz {
             return Ok(());
         }
@@ -285,11 +323,16 @@ impl RustboxWindow {
         self.state.maximized_horz = false;
         self.frame.maximized = false;
 
-        if let Some(r) = self.state.restore_position() {
-            self.frame.move_resize(conn, r.x, r.y, r.width, r.height)?;
-            self.reconfigure_client(conn, r.width, r.height)?;
-            self.geometry = r;
-        }
+        // Fall back to a centered default if no sensible restore point exists
+        // (e.g. the window was already maximized when it was managed).
+        let r = self
+            .state
+            .restore_position()
+            .filter(|r| !Self::covers_workarea(*r, wa))
+            .unwrap_or_else(|| Self::default_normal_rect(wa));
+        self.frame.move_resize(conn, r.x, r.y, r.width, r.height)?;
+        self.reconfigure_client(conn, r.width, r.height)?;
+        self.geometry = r;
         Ok(())
     }
 
