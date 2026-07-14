@@ -48,6 +48,25 @@ resources live there.
 | CPU      | ~0.6 %         | Event loop blocks while idle; essentially idle.                                   |
 | VRAM     | ~0.15 MB       | Root + toolbar + tray windows and GCs. Grows only with notifications (≈4 KB icon pixmap each) and managed window frames. |
 
+### Resource usage — Wallpaper mode
+
+Same build/runtime as above but compiled **with** the `wallpaper` feature
+(default). The wallpaper is an X11 server-side pixmap set as the root
+background; it adds a one-time decode/scale cost at startup and again on every
+screen resize.
+
+Measured idle on Xephyr at **1920×1080**:
+
+| Resource        | Average (idle) | Notes                                                                                                                      |
+|-----------------|----------------|----------------------------------------------------------------------------------------------------------------------------|
+| RAM             | ~62.8 MB (RSS) | ~35 MB above the no-wallpaper figure. This is glibc heap fragmentation left over from the one-time PNG decode+scale; it is **resolution-independent** (the displayed pixels live in the X server, not in the WM). `malloc_trim` at startup releases the freed decode buffers, keeping `VmSize` at ~282 MB. |
+| CPU             | ~0.6 %         | Idle; the wallpaper is painted once (and again only on resize).                                                            |
+| VRAM (X server) | ~8.4 MB        | Root background pixmap at 1920×1080×4 ≈ 8.3 MB. Scales with resolution: ~3.1 MB at 1024×768, ~33 MB at 4K.                |
+
+To reclaim the ~35 MB of RSS on constrained hardware, build **without** the
+`wallpaper` feature (see Compile-time features) — you get the gray-background
+WM at ~27.6 MB instead, with identical functionality otherwise.
+
 ## Features
 
 | Area              | What's working                                              |
