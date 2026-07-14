@@ -18,6 +18,10 @@ pub struct WindowState {
     pub modal: bool,
     pub rescaling: bool,
     pub position: Option<Rectangle>,
+    /// Geometry to return to when leaving fullscreen. Kept separate from
+    /// `position` so it never interferes with the maximize/unmaximize
+    /// restore point.
+    pub fullscreen_restore: Option<Rectangle>,
     pub workspace: u32,
     pub previous_workspace: u32,
 }
@@ -41,6 +45,7 @@ impl WindowState {
             modal: false,
             rescaling: false,
             position: None,
+            fullscreen_restore: None,
             workspace: 0,
             previous_workspace: 0,
         }

@@ -1,7 +1,7 @@
 //! COLRv1 color-emoji rasterization.
 //!
 //! The system emoji font (`Noto-COLRv1.ttf`) stores color glyphs as vector
-//! layers (COLRv1), not embedded bitmaps, so `ttf_parser`'s
+//! layers (COLRv1), not embedded bitmaps.
 //! `glyph_raster_image` returns `None`. This module walks the COLRv1 paint
 //! graph with [`skrifa`] and rasterizes it to an RGBA bitmap via
 //! [`tiny_skia`], producing real colored emojis instead of the yellow

@@ -21,9 +21,12 @@
 //! tray — exactly like it already does for XEmbed icons.
 
 use std::os::unix::io::RawFd;
-use std::sync::mpsc::{self, RecvTimeoutError, Receiver, Sender};
+use crate::notify::SignalEvent;
+
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
+
+use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 
 use zbus::{
     connection, fdo, interface, object_server::SignalEmitter, proxy, Connection,
@@ -76,7 +79,7 @@ trait StatusNotifierItem {
 
 /// The `org.kde.StatusNotifierWatcher` service we expose on the session bus.
 struct Watcher {
-    cmd_tx: Sender<Command>,
+    cmd_tx: UnboundedSender<Command>,
 }
 
 #[interface(name = "org.kde.StatusNotifierWatcher")]
@@ -93,7 +96,7 @@ impl Watcher {
         // Telegram/Electron.
         let _ = self
             .cmd_tx
-            .send(Command::Register {
+            .unbounded_send(Command::Register {
                 bus: service,
                 path: "/StatusNotifierItem".into(),
             });
@@ -111,7 +114,7 @@ impl Watcher {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> fdo::Result<()> {
         let _ = emitter.status_notifier_item_unregistered(&service).await;
-        let _ = self.cmd_tx.send(Command::Unregister { bus: service });
+        let _ = self.cmd_tx.unbounded_send(Command::Unregister { bus: service });
         Ok(())
     }
 
@@ -147,16 +150,19 @@ impl Watcher {
 /// `mpsc` receiver (thread -> WM) and the self-pipe read fd to wake `poll`.
 pub struct SniManager {
     rx: Receiver<SniEvent>,
-    activate_tx: Sender<ActivateRequest>,
+    activate_tx: UnboundedSender<ActivateRequest>,
     wake_r: RawFd,
     _wake_w: RawFd,
 }
 
 impl SniManager {
-    /// Spawn the SNI D-Bus thread. Never fails fatally: if the session bus is
-    /// unavailable the thread logs and exits, but the WM keeps running (it just
-    /// won't show modern tray icons).
-    pub fn new() -> anyhow::Result<Self> {
+    /// Spawn the SNI + notifications D-Bus thread. `notify_tx` is the channel
+    /// sender used by the `org.freedesktop.Notifications` handler; `signal_rx`
+    /// receives signal-emission requests from the main thread.
+    pub fn new(
+        notify_tx: Sender<crate::notify::NotifyCommand>,
+        signal_rx: futures_channel::mpsc::UnboundedReceiver<SignalEvent>,
+    ) -> anyhow::Result<Self> {
         let mut fds = [0 as RawFd; 2];
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
             return Err(anyhow::anyhow!("SNI: falha ao criar self-pipe"));
@@ -166,10 +172,12 @@ impl SniManager {
         set_nonblocking(wake_w);
 
         let (to_wm_tx, to_wm_rx) = mpsc::channel();
-        let (activate_tx, activate_rx) = mpsc::channel();
+        let (activate_tx, activate_rx) = futures_channel::mpsc::unbounded();
 
         thread::Builder::new().name("rustbox-sni".into()).spawn(move || {
-            let res = smol::block_on(run_sni(to_wm_tx, activate_rx, wake_w));
+            let res = smol::block_on(run_sni(
+                to_wm_tx, activate_rx, wake_w, notify_tx, signal_rx,
+            ));
             if let Err(e) = res {
                 log::warn!("SNI: thread encerrou (tray moderna indisponível): {e}");
             }
@@ -196,7 +204,7 @@ impl SniManager {
 
     /// Ask the SNI thread to invoke `Activate` on `service` (a tray click).
     pub fn activate(&self, service: &str, x: i32, y: i32) {
-        let _ = self.activate_tx.send(ActivateRequest {
+        let _ = self.activate_tx.unbounded_send(ActivateRequest {
             service: service.to_string(),
             x,
             y,
@@ -205,7 +213,7 @@ impl SniManager {
 
     /// Clone of the channel used to forward click/activate requests to the
     /// SNI thread. Stored on each screen so a tray click can reach the thread.
-    pub fn activator(&self) -> Sender<ActivateRequest> {
+    pub fn activator(&self) -> UnboundedSender<ActivateRequest> {
         self.activate_tx.clone()
     }
 
@@ -244,58 +252,67 @@ fn signal_pipe(fd: RawFd) {
 
 async fn run_sni(
     to_wm_tx: Sender<SniEvent>,
-    activate_rx: Receiver<ActivateRequest>,
+    mut activate_rx: UnboundedReceiver<ActivateRequest>,
     wake_w: RawFd,
+    notify_tx: Sender<crate::notify::NotifyCommand>,
+    mut signal_rx: futures_channel::mpsc::UnboundedReceiver<SignalEvent>,
 ) -> zbus::Result<()> {
-    let (cmd_tx, cmd_rx) = mpsc::channel();
+    use futures_util::select;
+    use futures_util::stream::StreamExt;
+
+    let (cmd_tx, mut cmd_rx) = futures_channel::mpsc::unbounded();
 
     let conn = connection::Builder::session()?
         .name("org.kde.StatusNotifierWatcher")?
+        .name("org.freedesktop.Notifications")?
         .serve_at("/StatusNotifierWatcher", Watcher { cmd_tx })?
+        .serve_at(
+            "/org/freedesktop/Notifications",
+            crate::notify::NotificationsHandler::new(notify_tx),
+        )?
         .build()
         .await?;
 
-    log::info!("SNI: StatusNotifierWatcher registrado no barramento de sessão");
+    log::info!("SNI: StatusNotifierWatcher + Notifications registrados no barramento");
     signal_pipe(wake_w);
 
     loop {
-        // Drain click/activate requests from the WM.
-        loop {
-            match activate_rx.recv_timeout(Duration::ZERO) {
-                Ok(req) => {
-                    if let Ok(proxy) = StatusNotifierItemProxy::builder(&conn)
-                        .destination(req.service.as_str())?
-                        .path("/StatusNotifierItem")?
-                        .build()
-                        .await
-                    {
-                        if let Err(e) = proxy.activate(req.x, req.y).await {
-                            log::debug!("SNI: Activate em {} falhou: {e}", req.service);
-                        }
+        select! {
+            req = activate_rx.select_next_some() => {
+                if let Ok(proxy) = StatusNotifierItemProxy::builder(&conn)
+                    .destination(req.service.as_str())?
+                    .path("/StatusNotifierItem")?
+                    .build()
+                    .await
+                {
+                    if let Err(e) = proxy.activate(req.x, req.y).await {
+                        log::debug!("SNI: Activate em {} falhou: {e}", req.service);
                     }
                 }
-                Err(RecvTimeoutError::Timeout) => break,
-                Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            }
+            cmd = cmd_rx.select_next_some() => {
+                match cmd {
+                    Command::Register { bus, path } => {
+                        let _ = handle_register(&conn, &to_wm_tx, &bus, &path, wake_w).await;
+                    }
+                    Command::Unregister { bus } => {
+                        let _ = to_wm_tx.send(SniEvent::Unregistered { service: bus });
+                        signal_pipe(wake_w);
+                    }
+                }
+            }
+            sig = signal_rx.select_next_some() => {
+                match sig {
+                    SignalEvent::NotificationClosed { id, reason } => {
+                        crate::notify::emit_closed_signal(&conn, id, reason).await;
+                    }
+                    SignalEvent::ActionInvoked { id, action_key } => {
+                        crate::notify::emit_action_signal(&conn, id, &action_key).await;
+                    }
+                }
             }
         }
-
-        // Process registration/unregistration from the Watcher interface.
-        match cmd_rx.recv_timeout(Duration::ZERO) {
-            Ok(Command::Register { bus, path }) => {
-                let _ = handle_register(&conn, &to_wm_tx, &bus, &path, wake_w).await;
-            }
-            Ok(Command::Unregister { bus }) => {
-                let _ = to_wm_tx.send(SniEvent::Unregistered { service: bus });
-                signal_pipe(wake_w);
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-
-        smol::Timer::after(Duration::from_millis(50)).await;
     }
-
-    Ok(())
 }
 
 async fn handle_register(

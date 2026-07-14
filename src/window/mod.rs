@@ -95,13 +95,13 @@ impl RustboxWindow {
     }
 
     /// Repaint the title bar (used in response to Expose events).
-    pub fn redraw_title(&self, conn: &X11Connection) {
+    pub fn redraw_title(&mut self, conn: &X11Connection) {
         let _ = self.frame.draw_titlebar(conn);
     }
 
     /// Make the window (frame + client) visible. Used when its workspace is
     /// switched to.
-    pub fn show(&self, conn: &X11Connection) -> Result<(), anyhow::Error> {
+    pub fn show(&mut self, conn: &X11Connection) -> Result<(), anyhow::Error> {
         self.frame.show(conn)?;
         conn.conn().map_window(self.client.window())?;
         Ok(())
@@ -358,9 +358,11 @@ impl RustboxWindow {
         let bw = self.frame.border_width();
         let th = self.frame.title_height();
         if fs {
-            if !self.state.maximized_vert && !self.state.maximized_horz {
-                self.state.save_position(self.geometry);
-            }
+            // Remember the pre-fullscreen geometry so we can always rebuild the
+            // decorations on exit — even for already-maximized windows (which do
+            // not save a maximize restore point). Kept separate from
+            // `position` so it never disturbs unmaximize.
+            self.state.fullscreen_restore = Some(self.geometry);
             // Move frame to (0,0) and fill entire screen
             conn.conn().configure_window(
                 self.frame.frame_window(),
@@ -387,7 +389,7 @@ impl RustboxWindow {
             if !self.is_shaded() {
                 let _ = conn.conn().map_window(self.frame.handle_window());
             }
-            if let Some(r) = self.state.restore_position() {
+            if let Some(r) = self.state.fullscreen_restore {
                 // Restore frame
                 conn.conn().configure_window(
                     self.frame.frame_window(),
@@ -409,9 +411,12 @@ impl RustboxWindow {
                     self.frame.title_window(),
                     &ConfigureWindowAux::new().width(r.width as u32),
                 )?;
-                self.frame.draw_titlebar(conn)?;
                 self.geometry = r;
             }
+            // Always repaint the titlebar on exit so the decoration windows
+            // never get left showing their blank white background (the
+            // "white bar" seen when leaving fullscreen from a maximized window).
+            self.frame.draw_titlebar(conn)?;
         }
         self.send_configure_notify(conn)?;
         Ok(())

@@ -11,13 +11,34 @@ use crate::keys::{self, KeyAction, KeyBinding};
 use crate::menu::menu::Menu;
 use crate::menu::menuitem::{MenuItem, MenuItemType};
 use crate::render::font::Font;
+#[cfg(feature = "wallpaper")]
+use crate::render::image::Image;
 use crate::slit::FbSlit;
 use crate::sni::{ActivateRequest, SniEvent};
+use futures_channel::mpsc::UnboundedSender;
 use crate::toolbar::{FbToolbar, ToolbarAction, ToolbarPlacement};
 use crate::tray::FbTray;
 use crate::window::{FbWinFrame, RustboxWindow, WinClient, WindowId, WindowManager};
 use crate::workspace::Workspace;
 use crate::x11::{Atom, Event, X11Connection};
+
+/// Wallpaper bundled at compile time (scr file of the project).
+#[cfg(feature = "wallpaper")]
+const WALLPAPER_BYTES: &[u8] = include_bytes!("../wallpaper.png");
+
+/// Append a line to ~/.rustbox/startup.log and flush, so a startup failure
+/// can be localized even when no terminal is available.
+pub fn trace_step(msg: &str) {
+    if let Ok(home) = std::env::var("HOME") {
+        let path = format!("{}/.rustbox/startup.log", home);
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+            use std::io::Write;
+            let _ = writeln!(f, "[startup] {}", msg);
+            let _ = f.flush();
+        }
+    }
+}
+
 
 /// Log (instead of silently discarding) best-effort X11 protocol errors,
 /// while still dropping the unused cookie/value. Used to replace the many
@@ -94,7 +115,7 @@ pub struct BScreen {
             slit: FbSlit,
             tray: FbTray,
     /// Channel to request StatusNotifierItem activation (left-click).
-    sni_activator: Option<std::sync::mpsc::Sender<ActivateRequest>>,
+    sni_activator: Option<UnboundedSender<ActivateRequest>>,
     taskbar_order: Vec<WindowId>,
     hidden: std::collections::HashSet<WindowId>,
     /// Window ids of decoration frames we created ourselves. Used to ignore
@@ -148,6 +169,7 @@ impl BScreen {
         let root = screen.root;
         let width = screen.width_in_pixels;
         let height = screen.height_in_pixels;
+        trace_step("BScreen::new: start");
 
         let workspace_names: Vec<String> = (0..4).map(|i| format!("{}", i + 1)).collect();
 
@@ -158,9 +180,12 @@ impl BScreen {
             workspace_names.clone(),
             ToolbarPlacement::Bottom,
         )?;
+        trace_step("BScreen::new: toolbar ok");
         let slit = FbSlit::new(&conn, width, height, crate::slit::SlitPlacement::Right)?;
+        trace_step("BScreen::new: slit ok");
         let mut tray = FbTray::new(&conn, width, height)?;
         tray.set_anchor(toolbar.tray_right_anchor());
+        trace_step("BScreen::new: tray ok");
 
         let mut screen = Self {
             screen_num,
@@ -226,7 +251,8 @@ impl BScreen {
                 }
             }
         }
-        // Original Rustbox desktop is a neutral gray rather than black.
+        // Original Rustbox desktop is a neutral gray rather than black. Paint
+        // the bundled wallpaper if it loads; otherwise fall back to gray.
         let gray = match screen
             .conn
             .conn()
@@ -235,11 +261,75 @@ impl BScreen {
             Ok(cookie) => cookie.reply().map(|r| r.pixel).unwrap_or(0x808080),
             Err(_) => 0x808080,
         };
+
+        // Always paint a solid gray root first, so the desktop is visible even
+        // if the wallpaper step fails for any reason.
         let _ = screen.conn.conn().change_window_attributes(
             root,
             &ChangeWindowAttributesAux::new().background_pixel(gray),
         );
         let _ = screen.conn.conn().clear_area(false, root, 0, 0, 0, 0);
+
+        // Wallpaper is opt-in and fully isolated: compiled behind the
+        // `wallpaper` feature, skipped at runtime when RUSTBOX_NO_WALLPAPER is
+        // set, and any failure just keeps the gray background. It can never
+        // prevent the WM from starting.
+        #[cfg(feature = "wallpaper")]
+        if std::env::var("RUSTBOX_NO_WALLPAPER").is_err() {
+            let rdepth = screen.conn.screen().root_depth;
+            let maxreq = screen.conn.conn().setup().maximum_request_length;
+            trace_step(&format!(
+                "wallpaper: tentando aplicar (root_depth={}, tela={}x{}, max_req={})",
+                rdepth, width, height, maxreq
+            ));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let wallpaper_bytes = std::env::var("HOME").ok().and_then(|home| {
+                    let png = format!("{}/.rustbox/wallpaper.png", home);
+                    if std::path::Path::new(&png).exists() {
+                        std::fs::read(png).ok()
+                    } else {
+                        None
+                    }
+                });
+
+                let src: &[u8] = match &wallpaper_bytes {
+                    Some(b) => b.as_slice(),
+                    None => WALLPAPER_BYTES,
+                };
+                if let Ok(img) = Image::from_memory(src) {
+                    if let Ok(scaled) = img.scale(width as u32, height as u32) {
+                        match scaled.create_pixmap(screen.conn.conn(), screen.conn.screen(), root) {
+                            Ok(pix) => {
+                                let _ = screen.conn.conn().change_window_attributes(
+                                    root,
+                                    &ChangeWindowAttributesAux::new().background_pixmap(pix),
+                                );
+                                let _ = screen.conn.conn().clear_area(false, root, 0, 0, 0, 0);
+                                trace_step("wallpaper: APLICADO COM SUCESSO");
+                            }
+                            Err(e) => {
+                                trace_step(&format!("wallpaper: FALHA create_pixmap: {e}"));
+                                log::warn!("wallpaper: falha ao criar pixmap: {e}; usando cinza");
+                            }
+                        }
+                    } else {
+                        trace_step("wallpaper: FALHA ao redimensionar imagem");
+                        log::warn!("wallpaper: falha ao redimensionar imagem; usando cinza");
+                    }
+                } else {
+                    trace_step("wallpaper: FALHA ao decodificar imagem (formato nao suportado?)");
+                    log::warn!("wallpaper: falha ao decodificar imagem; usando cinza");
+                }
+            }));
+        }
+        trace_step("BScreen::new: background set");
+
+        // Force the glibc memory allocator to release all freed pages (from the
+        // large decoded wallpaper image and scale buffers) back to the OS.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::malloc_trim(0);
+        }
 
         for (i, name) in workspace_names.iter().enumerate() {
             let ws = Workspace::new(i as u32, name);
@@ -254,9 +344,11 @@ impl BScreen {
 
         screen.recalc_struts();
         screen.query_monitors();
+        trace_step("BScreen::new: query_monitors ok");
         screen.update_workarea();
         screen.toolbar.show(&screen.conn)?;
         screen.toolbar.render(&screen.conn)?;
+        trace_step("BScreen::new: toolbar shown+rendered");
 
         // Publish EWMH properties so clients know the usable workarea.
         let _ = screen.publish_workarea();
@@ -267,11 +359,14 @@ impl BScreen {
         }
 
         screen.conn.flush()?;
+        trace_step("BScreen::new: flushed; scanning windows");
 
         screen.scan_windows()?;
+        trace_step("BScreen::new: scan_windows ok");
 
         // Load and apply keybindings
         screen.init_keys()?;
+        trace_step("BScreen::new: init_keys ok");
 
         Ok(screen)
     }
@@ -728,6 +823,11 @@ impl BScreen {
         self.root_width = new_w;
         self.root_height = new_h;
 
+        // Re-create the wallpaper at the new resolution so it fills the
+        // screen instead of being cropped or mis-scaled.
+        #[cfg(feature = "wallpaper")]
+        self.re_apply_wallpaper(new_w, new_h);
+
         // Refit the dock UI to the new screen size.
         self.toolbar.reconfigure(&self.conn, new_w, new_h)?;
         self.slit.reconfigure(&self.conn, new_w, new_h)?;
@@ -776,8 +876,52 @@ impl BScreen {
         Ok(())
     }
 
+    /// Re-create the wallpaper pixmap at a new screen size (called on
+    /// resolution change). Any failure is silently ignored — the background
+    /// simply keeps whatever it had before.
+    #[cfg(feature = "wallpaper")]
+    fn re_apply_wallpaper(&mut self, new_w: u16, new_h: u16) {
+        if std::env::var("RUSTBOX_NO_WALLPAPER").is_ok() {
+            return;
+        }
+        let root = self.root_window;
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let wallpaper_bytes = std::env::var("HOME").ok().and_then(|home| {
+                let png = format!("{}/.rustbox/wallpaper.png", home);
+                if std::path::Path::new(&png).exists() {
+                    std::fs::read(png).ok()
+                } else {
+                    None
+                }
+            });
+
+            let src: &[u8] = match &wallpaper_bytes {
+                Some(b) => b.as_slice(),
+                None => WALLPAPER_BYTES,
+            };
+            if let Ok(img) = Image::from_memory(src) {
+                if let Ok(scaled) = img.scale(new_w as u32, new_h as u32) {
+                    if let Ok(pix) =
+                        scaled.create_pixmap(self.conn.conn(), self.conn.screen(), root)
+                    {
+                        let _ = self.conn.conn().change_window_attributes(
+                            root,
+                            &ChangeWindowAttributesAux::new().background_pixmap(pix),
+                        );
+                        let _ = self.conn.conn().clear_area(false, root, 0, 0, 0, 0);
+                    }
+                }
+            }
+        }));
+        // Trim free heap memory after scaling the wallpaper on resize.
+        #[cfg(target_os = "linux")]
+        unsafe {
+            libc::malloc_trim(0);
+        }
+    }
+
     /// Wire the SNI activation channel (called once the `SniManager` exists).
-    pub fn set_sni_activator(&mut self, activator: std::sync::mpsc::Sender<ActivateRequest>) {
+    pub fn set_sni_activator(&mut self, activator: UnboundedSender<ActivateRequest>) {
         self.sni_activator = Some(activator);
     }
 
@@ -943,6 +1087,10 @@ impl BScreen {
             window,
             self.window_manager.windows().count()
         );
+        // Repaint the root background where the window lived. Destroying the
+        // frame exposes the root, and without this the area stays black
+        // instead of showing the gray/wallpaper background.
+        let _ = self.conn.conn().clear_area(false, self.root_window, 0, 0, 0, 0);
         Ok(())
     }
 
@@ -1167,6 +1315,7 @@ impl BScreen {
     /// Redraw the toolbar (used by the periodic clock tick). Cheaper than
     /// update_toolbar because it does not rebuild the window list.
     pub fn toolbar_render(&mut self, conn: &X11Connection) -> Result<(), anyhow::Error> {
+        self.toolbar.refresh_battery();
         self.toolbar.render(conn)?;
         conn.flush()?;
         Ok(())
@@ -1207,6 +1356,13 @@ impl BScreen {
         // A managed client lives inside our frame; its requested geometry is
         // relative to the frame, so we apply it directly to the client.
         self.conn.conn().configure_window(window, &aux)?;
+
+        // When the client requests a new size, resize the frame to match.
+        if (mask & (CF_WIDTH | CF_HEIGHT)) != 0 {
+            if let Some(rw) = self.window_manager.get_window_mut(window) {
+                rw.frame_mut().resize(&self.conn, w, h)?;
+            }
+        }
         Ok(())
     }
 
@@ -1251,23 +1407,32 @@ impl BScreen {
                         let dlg = self.dialog.as_ref().unwrap();
                         (dlg.window, dlg.frame)
                     };
-                    if e.event == win || e.event == frame {
+                    let frame_children: Vec<u32> = self.window_manager
+                        .get_window(win)
+                        .map(|w| {
+                            let f = w.frame();
+                            vec![f.frame_window, f.title_window, f.handle_window]
+                        })
+                        .unwrap_or_default();
+                    if e.event == win
+                        || e.event == frame
+                        || frame_children.contains(&e.event)
+                    {
                         // Click inside the dialog — keep it open and re-focus.
                         let _ = self.conn.conn().set_input_focus(
                             xproto::InputFocus::PARENT,
                             win,
                             0u32,
                         );
-                        // Release the frozen SYNC grab_button event.
+                        let _ = self.conn.conn().allow_events(Allow::REPLAY_POINTER, 0u32);
+                        // Don't return — let the event fall through to the
+                        // normal handler so titlebar buttons (close, iconify)
+                        // and move/resize still work.
+                    } else {
+                        // Click outside the dialog — ignore (don't dismiss).
                         let _ = self.conn.conn().allow_events(Allow::REPLAY_POINTER, 0u32);
                         return Ok(());
                     }
-                    // Click outside the dialog — dismiss it (like a menu).
-                    self.close_dialog()?;
-                    // Release the frozen SYNC grab_button event for the window
-                    // beneath the pointer so it can receive the click.
-                    let _ = self.conn.conn().allow_events(Allow::REPLAY_POINTER, 0u32);
-                    return Ok(());
                 }
                 _ => {}
             }
@@ -1432,10 +1597,15 @@ impl BScreen {
                         }
                     }
                 } else {
-                    for w in self.window_manager.windows() {
-                        if e.window == w.frame().title_window() {
+                    let win_id = self.window_manager.windows()
+                        .find(|w| {
+                            e.window == w.frame().title_window()
+                                || e.window == w.frame().frame_window()
+                        })
+                        .map(|w| w.id());
+                    if let Some(id) = win_id {
+                        if let Some(w) = self.window_manager.get_window_mut(id) {
                             w.redraw_title(&self.conn);
-                            break;
                         }
                     }
                 }
@@ -1459,7 +1629,7 @@ impl BScreen {
                         self.tray.toggle_popup(&self.conn)?;
                     } else if let Some(service) = self.tray.sni_slot_at(e.event_x, e.event_y) {
                         if let Some(tx) = &self.sni_activator {
-                            let _ = tx.send(ActivateRequest {
+                            let _ = tx.unbounded_send(ActivateRequest {
                                 service,
                                 x: e.root_x as i32,
                                 y: e.root_y as i32,
@@ -1825,8 +1995,8 @@ impl BScreen {
 
         let screen = self.conn.screen();
         let root = self.conn.root_window();
-        let fg = screen.black_pixel;
-        let bg = screen.white_pixel;
+        let fg = crate::hooks::or(&crate::hooks::DIALOG_FG, screen.black_pixel);
+        let bg = crate::hooks::or(&crate::hooks::DIALOG_BG, screen.white_pixel);
 
         let cx = (screen.width_in_pixels as i16 - W as i16) / 2;
         let cy = (screen.height_in_pixels as i16 - H as i16) / 2;
@@ -1903,6 +2073,13 @@ impl BScreen {
         );
 
         self.manage_window(window)?;
+
+        // Remove maximize button — unnecessary for a dialog.
+        if let Some(fbwin) = self.window_manager.get_window_mut(window) {
+            fbwin.frame_mut().no_maximize = true;
+            fbwin.frame_mut().layout_buttons();
+            let _ = fbwin.redraw_title(&self.conn);
+        }
 
         let _ = self.conn.conn().change_window_attributes(
             window,
@@ -2064,8 +2241,8 @@ impl BScreen {
             None => return Ok(()),
         };
         let screen = self.conn.screen();
-        let fg = screen.black_pixel;
-        let bg = screen.white_pixel;
+        let fg = crate::hooks::or(&crate::hooks::DIALOG_FG, screen.black_pixel);
+        let bg = crate::hooks::or(&crate::hooks::DIALOG_BG, screen.white_pixel);
         let font = Font::new("fixed");
         let window = dlg.window;
         let gc = dlg.gc;

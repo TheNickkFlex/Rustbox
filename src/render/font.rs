@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use ab_glyph::{Font as AbFont, FontRef, OutlinedGlyph, PxScale, ScaleFont};
-use image::{load_from_memory, RgbaImage};
-use ttf_parser::Face;
+use ab_glyph::{Font as AbFont, FontRef, PxScale, ScaleFont};
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{self, ConnectionExt as _, Gcontext};
 use x11rb::rust_connection::RustConnection;
@@ -32,6 +30,43 @@ static TEXT_DB: OnceLock<fontdb::Database> = OnceLock::new();
 static TEXT_FONT: OnceLock<Option<FontData>> = OnceLock::new();
 static TEXT_FR: OnceLock<Option<FontRef<'static>>> = OnceLock::new();
 static EMOJI_FONT: OnceLock<Option<FontData>> = OnceLock::new();
+
+#[derive(Clone)]
+struct CachedGlyph {
+    x_off: f32,
+    y_off: f32,
+    w: u16,
+    h: u16,
+    cov: Vec<u8>,
+}
+
+static GLYPH_CACHE: OnceLock<Mutex<HashMap<(char, u32), CachedGlyph>>> = OnceLock::new();
+
+fn rasterize_glyph(ch: char, px: f32, font_ref: &FontRef<'static>) -> Option<CachedGlyph> {
+    let px_key = px.round() as u32;
+    let cache = GLYPH_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    {
+        let guard = cache.lock().unwrap();
+        if let Some(cached) = guard.get(&(ch, px_key)) {
+            return Some(cached.clone());
+        }
+    }
+    let scaled = font_ref.as_scaled(PxScale::from(px));
+    let og = font_ref.outline_glyph(scaled.scaled_glyph(ch))?;
+    let bounds = og.px_bounds();
+    let w = (bounds.max.x - bounds.min.x).ceil().max(1.0) as u16;
+    let h = (bounds.max.y - bounds.min.y).ceil().max(1.0) as u16;
+    let mut cov = vec![0u8; w as usize * h as usize];
+    og.draw(|gx, gy, coverage| {
+        let idx = gy as usize * w as usize + gx as usize;
+        if idx < cov.len() {
+            cov[idx] = (coverage * 255.0) as u8;
+        }
+    });
+    let cached = CachedGlyph { x_off: bounds.min.x, y_off: bounds.min.y, w, h, cov };
+    cache.lock().unwrap().insert((ch, px_key), cached.clone());
+    Some(cached)
+}
 
 fn db() -> &'static fontdb::Database {
     TEXT_DB.get_or_init(|| {
@@ -160,29 +195,15 @@ pub fn render_emoji(cp: u32, px: u32) -> Option<(u32, u32, Vec<u8>)> {
     }
 
     let fd = emoji_font_data()?;
-    let face = Face::parse(&fd.data, fd.face_index).ok()?;
+    let fr = FontRef::try_from_slice(&fd.data).ok()?;
     let ch = char::from_u32(cp)?;
-    let gid = face.glyph_index(ch)?;
-
-    // Try embedded PNG first (CBDT/CBLC fonts).
-    if let Some(img) = face.glyph_raster_image(gid, px as u16) {
-        if let Ok(decoded) = load_from_memory(img.data) {
-            let rgba = decoded.to_rgba8();
-            let (w, h) = rgba.dimensions();
-            return Some((w, h, rgba.into_raw()));
-        }
-    }
-
-    // Fallback: render the outline glyph as a monochrome silhouette via
-    // ab_glyph.  This handles COLR/COLRv1 color fonts that don't store
-    // embedded PNGs.
-    fallback_emoji_outline(&fd.data, fd.face_index, gid, ch, px)
+    fallback_emoji_outline(&fd.data, ch, px)
 }
 
 /// Render a glyph outline to an RGBA8 bitmap using `ab_glyph` so it can be
 /// composited like a colour emoji.  The glyph is filled with a warm yellow
 /// (#FFCC00) so it looks vaguely like a generic emoji.
-fn fallback_emoji_outline(data: &[u8], _index: u32, _gid: ttf_parser::GlyphId, ch: char, px: u32) -> Option<(u32, u32, Vec<u8>)> {
+fn fallback_emoji_outline(data: &[u8], ch: char, px: u32) -> Option<(u32, u32, Vec<u8>)> {
     let fr = FontRef::try_from_slice(data).ok()?;
     let scaled = fr.as_scaled(PxScale::from(px as f32));
     let sglyph = scaled.scaled_glyph(ch);
@@ -326,6 +347,57 @@ impl Font {
         Ok(self.measure(text).ceil() as u16)
     }
 
+    /// Per-character pixel widths — computes each char advance exactly once.
+    /// Used by `truncate_ellipsis` for O(n) precomputation instead of O(n log n).
+    fn char_widths(&self, text: &str) -> Vec<u16> {
+        if let Some(fr) = text_font_ref() {
+            let px = self.px();
+            let scaled = fr.as_scaled(PxScale::from(px));
+            text.chars().map(|ch| {
+                if is_emoji(ch) {
+                    if ch == '\u{200D}' || ch == '\u{FE0F}' { 0 } else { px as u16 }
+                } else {
+                    scaled.h_advance(fr.glyph_id(ch)).ceil() as u16
+                }
+            }).collect()
+        } else {
+            let w = crate::render::bitmap_font::GLYPH_WIDTH * self.scale;
+            text.chars().map(|_| w).collect()
+        }
+    }
+
+    /// Truncate `text` with an ellipsis so it fits within `max_width` pixels.
+    /// Precomputes per-char widths once (O(n)) then binary searches on
+    /// cumulative sums (O(log n)) — total O(n + log n).
+    pub fn truncate_ellipsis(&self, text: &str, max_width: i16) -> String {
+        if text.is_empty() || max_width <= 0 {
+            return String::new();
+        }
+        let widths = self.char_widths(text);
+        let full_w: u16 = widths.iter().sum();
+        if (full_w as i16) <= max_width {
+            return text.to_string();
+        }
+        let ellipsis_w = self.measure("\u{2026}").ceil() as i16;
+        let target = max_width.saturating_sub(ellipsis_w);
+        let mut cumul = Vec::with_capacity(widths.len());
+        let mut sum = 0u16;
+        for &w in &widths {
+            sum = sum.saturating_add(w);
+            cumul.push(sum);
+        }
+        let n = widths.len();
+        let mut lo = 0usize;
+        let mut hi = n;
+        while lo < hi {
+            let mid = (lo + hi + 1) / 2;
+            if (cumul[mid - 1] as i16) <= target { lo = mid; } else { hi = mid - 1; }
+        }
+        let mut result: String = text.chars().take(lo).collect();
+        result.push('\u{2026}');
+        result
+    }
+
     /// Word-wrap `text` so no line exceeds `max_width` pixels (approximate,
     /// measured per fragment).
     pub fn wrap(&self, text: &str, max_width: u32) -> Vec<String> {
@@ -427,9 +499,13 @@ impl Font {
             }
             let gid = font_ref.glyph_id(ch);
             let adv = scaled.h_advance(gid);
-            if let Some(og) = font_ref.outline_glyph(scaled.scaled_glyph(ch)) {
+            if let Some(r) = rasterize_glyph(ch, px, font_ref) {
                 ops.push(GlyphOp::Text {
-                    og,
+                    x_off: r.x_off,
+                    y_off: r.y_off,
+                    w: r.w,
+                    h: r.h,
+                    cov: r.cov,
                     caret,
                     baseline: y,
                 });
@@ -612,7 +688,11 @@ fn composite_rgba(
 
 enum GlyphOp {
     Text {
-        og: OutlinedGlyph,
+        x_off: f32,
+        y_off: f32,
+        w: u16,
+        h: u16,
+        cov: Vec<u8>,
         caret: f32,
         baseline: f32,
     },
@@ -642,18 +722,27 @@ fn composite_ops(
     for op in ops {
         match op {
             GlyphOp::Text {
-                og,
+                x_off,
+                y_off,
+                w,
+                h,
+                cov,
                 caret,
                 baseline,
             } => {
-                let bounds = og.px_bounds();
-                let base_x = caret + bounds.min.x - bx_f;
-                let base_y = baseline + bounds.min.y - by_f;
-                og.draw(|gx, gy, cov| {
-                    let dx = (base_x + gx as f32) as i32;
-                    let dy = (base_y + gy as f32) as i32;
-                    blend(buf, dx, dy, stride, r, g, b, cov);
-                });
+                let base_x = caret + x_off - bx_f;
+                let base_y = baseline + y_off - by_f;
+                for gy in 0..*h {
+                    for gx in 0..*w {
+                        let c = cov[gy as usize * *w as usize + gx as usize];
+                        if c == 0 {
+                            continue;
+                        }
+                        let dx = (base_x + gx as f32) as i32;
+                        let dy = (base_y + gy as f32) as i32;
+                        blend(buf, dx, dy, stride, r, g, b, c as f32 / 255.0);
+                    }
+                }
             }
             GlyphOp::Emoji { x, y, w, h, rgba } => {
                 let dx0 = (x - bx_f) as i32;
