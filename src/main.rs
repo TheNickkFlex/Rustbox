@@ -33,6 +33,8 @@ fn main() -> Result<(), anyhow::Error> {
     .format_timestamp_secs()
     .init();
 
+    rustbox_rs::mods::init_all();
+
     log::debug!("DEBUG logging active — env_logger initialized");
 
     log::info!("Rustbox-rs 1.4.0 starting...");
@@ -75,8 +77,29 @@ fn main() -> Result<(), anyhow::Error> {
     )?;
     log::info!("Rustbox initialized");
 
+    // Force glibc to release all freed heap pages from the entire initialization
+    // phase (font database scanning, wallpaper decoding, and scaling) back to the OS.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::malloc_trim(0);
+    }
+
     log::info!("Entering main event loop");
-    rustbox.event_loop()?;
+    if let Err(e) = rustbox.event_loop() {
+        log::error!("Event loop terminou com erro: {:?}", e);
+        if let Ok(home) = std::env::var("HOME") {
+            if let Ok(mut f) = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(format!("{}/.rustbox/startup.log", home))
+            {
+                use std::io::Write;
+                let _ = writeln!(f, "[startup] FATAL event_loop error: {:?}", e);
+                let _ = f.flush();
+            }
+        }
+        return Err(e);
+    }
 
     log::info!("Rustbox shutting down");
     Ok(())

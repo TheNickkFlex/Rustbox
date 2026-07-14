@@ -158,6 +158,9 @@ impl Popup {
         p.redraw(conn)?;
         c.map_window(window)?;
         c.flush()?;
+        if let Some(cb) = crate::hooks::AFTER_NOTIFY_CREATE.get() {
+            cb(conn, window, w, h);
+        }
         Ok(p)
     }
 
@@ -455,6 +458,15 @@ impl Popup {
         if let Some(px) = self.icon_pix {
             let _ = c.free_pixmap(px);
         }
+        let pixels = [
+            self.bg_pixel,
+            self.fg_pixel,
+            self.frame_pixel,
+            self.body_pixel,
+            self.urgency_pixel,
+        ];
+        let cmap = conn.screen().default_colormap;
+        let _ = c.free_colors(cmap, 0, &pixels);
         let _ = c.free_gc(self.gc);
         let _ = c.destroy_window(self.window);
     }

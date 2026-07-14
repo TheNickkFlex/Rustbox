@@ -10,9 +10,14 @@ A fluxbox-based window manager written entirely in **Rust** (X11).
 
 *MUCH MORE COMING SOON!, HOOOPEE*
 
-## Alpha Preview
+## Beta Preview - *No Wallpaper Mode (Less Resource Usage, More About In Compile-time features)*
 
-![Rustbox in action](screenshot-alpha2.1.png)
+![Rustbox in action](screenshotbeta.png)
+
+
+## Beta Preview - *Wallpaper Mode (More Resource Usage, More About In Compile-time features)*
+
+![Rustbox in action](screenshotbetawallpaper.png)
 
 ## What is Rustbox?
 
@@ -39,7 +44,7 @@ resources live there.
 
 | Resource | Average (idle) | Notes                                                                             |
 |----------|----------------|-----------------------------------------------------------------------------------|
-| RAM      | ~29 MB (RSS)   | Stable; no leak over 10 s. Dominated by the font DB + emoji font loaded at startup. |
+| RAM      | ~27.6 MB (RSS)   | Stable; no leak over 10 s. Dominated by the font DB + emoji font loaded at startup. |
 | CPU      | ~0.6 %         | Event loop blocks while idle; essentially idle.                                   |
 | VRAM     | ~0.15 MB       | Root + toolbar + tray windows and GCs. Grows only with notifications (≈4 KB icon pixmap each) and managed window frames. |
 
@@ -126,12 +131,36 @@ cd Rustbox
 # Debug build
 cargo build
 
-# Release build (optimized, recommended for daily use)
+# Release build (Wallpaper Mode, See More Above in Compile-time features)
 cargo build --release
 
 # Install to ~/.cargo/bin (optional)
 cargo install --path .
 ```
+
+#### Compile-time features
+
+Rustbox is built with Cargo features. The default set is
+`xrender xinerama xrandr xshape composite wallpaper`.
+
+The bundled **wallpaper** is compiled behind the `wallpaper` feature. On
+extremely limited hardware you can build without it to skip the embedded image
+and the decode/scale step at runtime (lowers resident memory by ~35 MB in
+testing). Keep the other features enabled — they are required for the WM to
+compile and run:
+
+```bash
+# Wallpaper enabled (default)
+cargo build --release
+
+# Wallpaper disabled — leanest runtime, gray background instead
+cargo build --release --no-default-features \
+  --features "xrender xinerama xrandr xshape composite"
+```
+
+> Note: the `image` crate stays linked regardless, because it is also used for
+> tray icons, notifications and font rendering. Disabling `wallpaper` therefore
+> reduces *runtime* memory, not the binary size.
 
 ## Running
 

@@ -325,7 +325,6 @@ mod tests {
   [separator]
   [submenu] (Appearance)
     [config] (Configuration)
-    [exec] (Set Wallpaper) {fbsetbg -f ~/wallpaper.jpg}
   [end]
   [reconfig] (Reload)
   [restart] (Restart)

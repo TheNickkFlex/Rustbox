@@ -1,6 +1,7 @@
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{self, EventMask, WindowClass, ConnectionExt as _};
 
+use battery::{Manager, State};
 use crate::core::{Rectangle, Strut};
 use crate::render::font::Font;
 use crate::x11::X11Connection;
@@ -62,6 +63,14 @@ pub struct FbToolbar {
     /// Width (px) reserved on the right of the toolbar for the system tray,
     /// which sits immediately to the left of the clock. Updated by `BScreen`.
     tray_reserve: i16,
+    /// Battery indicator segment (between the tray and the clock). Width is 0
+    /// when no battery is present (e.g. a desktop), in which case nothing is
+    /// drawn and no space is reserved.
+    battery_width: i16,
+    battery_rect: Rectangle,
+    battery_manager: Option<Manager>,
+    battery_state: Option<(u8, State)>,
+    last_battery_check: std::time::Instant,
 }
 
 impl FbToolbar {
@@ -112,6 +121,26 @@ impl FbToolbar {
         let font = Font::new(&style.font);
         log::debug!("toolbar font x_id present: {}", font.x_id().is_some());
 
+        // Detect whether a battery exists so we only reserve space / draw the
+        // indicator on laptops. On desktops `Manager::new` or `batteries`
+        // fails and we simply skip it.
+        let (battery_manager, battery_width) = match Manager::new() {
+            Ok(mgr) => {
+                let has = mgr
+                    .batteries()
+                    .map(|mut b| b.next().is_some())
+                    .unwrap_or(false);
+                if has {
+                    (Some(mgr), 74)
+                } else {
+                    (None, 0)
+                }
+            }
+            Err(_) => (None, 0),
+        };
+
+        let toolbar_h = (style.height + style.border_width * 2) as u16;
+
         let mut tb = Self {
             window,
             gc,
@@ -130,8 +159,18 @@ impl FbToolbar {
             window_items: Vec::new(),
             window_rects: Vec::new(),
             tray_reserve: 0,
+            battery_width,
+            battery_rect: Rectangle::zero(),
+            battery_manager,
+            battery_state: None,
+            last_battery_check: std::time::Instant::now(),
         };
         tb.layout();
+
+        if let Some(cb) = crate::hooks::AFTER_TOOLBAR_CREATE.get() {
+            cb(conn, window, screen_width, toolbar_h);
+        }
+
         Ok(tb)
     }
 
@@ -185,15 +224,44 @@ impl FbToolbar {
 
     /// Screen-x of the tray's right edge (i.e. the left edge of the clock
     /// minus a gap). The tray anchors itself so its right edge lands here.
+    /// Accounts for the battery segment that sits between the tray and clock.
     pub fn tray_right_anchor(&self) -> i16 {
         let bw = self.style.border_width as i16;
         let clock_w: i16 = 144;
         let gap: i16 = 2;
-        (self.screen_width as i16) - clock_w - 2 * gap - bw
+        (self.screen_width as i16) - clock_w - self.battery_width - 3 * gap - bw
     }
 
     pub fn set_label(&mut self, label: String) {
         self.label = label;
+    }
+
+    /// Poll the battery (throttled to ~15 s) and cache `(percent, state)`.
+    /// Cheap no-op when no battery was detected at startup or when called more
+    /// often than the interval. Safe to call every clock tick.
+    pub fn refresh_battery(&mut self) {
+        if self.battery_manager.is_none() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        if now.duration_since(self.last_battery_check).as_secs() < 15 {
+            return;
+        }
+        self.last_battery_check = now;
+
+        let mgr = self.battery_manager.as_ref().unwrap();
+        let new_state = match mgr.batteries() {
+            Ok(mut batteries) => match batteries.next() {
+                Some(Ok(mut bat)) => {
+                    let _ = mgr.refresh(&mut bat);
+                    let pct = (bat.state_of_charge().value * 100.0).clamp(0.0, 100.0) as u8;
+                    Some((pct, bat.state()))
+                }
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        self.battery_state = new_state;
     }
 
     /// Replace the running-window list. Each entry is `(name, focused)`.
@@ -257,6 +325,15 @@ impl FbToolbar {
 
         self.label_rect = Rectangle::new(list_x, y, list_w.max(0) as u16, h);
         self.clock_rect = Rectangle::new(clock_x, y, clock_w.max(0) as u16, h);
+
+        // Battery segment sits immediately to the left of the clock (only when
+        // a battery is present).
+        if self.battery_width > 0 {
+            let bx = clock_x - self.battery_width - gap;
+            self.battery_rect = Rectangle::new(bx, y, self.battery_width as u16, h);
+        } else {
+            self.battery_rect = Rectangle::zero();
+        }
     }
 
     pub fn render(&mut self, conn: &X11Connection) -> Result<(), anyhow::Error> {
@@ -272,8 +349,8 @@ impl FbToolbar {
                 .height((self.style.height + self.style.border_width * 2) as u32),
         )?;
 
-        let white = self.bg_pixel;
-        let black = self.fg_pixel;
+        let white = crate::hooks::or(&crate::hooks::TOOLBAR_BG, self.bg_pixel);
+        let black = crate::hooks::or(&crate::hooks::TOOLBAR_FG, self.fg_pixel);
 
         // Clear the entire toolbar background so stale pixels from a previous
         // render (e.g. old clock digits, old window-list entries) don't bleed
@@ -353,23 +430,7 @@ impl FbToolbar {
                 )?;
 
                 let avail = (rect.width as i16 - 6).max(4);
-                let mut disp = name.clone();
-                let full_w = self.font.text_width(conn.conn(), &disp).unwrap_or(0) as i16;
-                if full_w > avail {
-                    let ellipsis_w = self.font.text_width(conn.conn(), "…").unwrap_or(8) as i16;
-                    let target = avail.saturating_sub(ellipsis_w);
-                    let n = disp.len();
-                    let mut lo = 0usize;
-                    let mut hi = n;
-                    while lo < hi {
-                        let mid = (lo + hi + 1) / 2;
-                        let prefix: String = disp.chars().take(mid).collect();
-                        let w = self.font.text_width(conn.conn(), &prefix).unwrap_or(0) as i16;
-                        if w <= target { lo = mid; } else { hi = mid - 1; }
-                    }
-                    disp = disp.chars().take(lo).collect();
-                    disp.push('…');
-                }
+                let disp = self.font.truncate_ellipsis(name, avail);
                 let ty = rect.y
                     + (rect.height as i16 + self.font.height() as i16) / 2
                     - self.font.descent() as i16;
@@ -383,6 +444,94 @@ impl FbToolbar {
         // Clock on the right.
         let clock = current_clock();
         self.draw_text(conn, &self.clock_rect, &clock, crate::core::Align::Right, black, white)?;
+
+        // Battery indicator (only when a battery is present).
+        if self.battery_width > 0 {
+            if let Some(state) = self.battery_state {
+                self.draw_battery(conn, &self.battery_rect, state, black, white)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Draw a small battery glyph (outline + proportional fill + nub) followed
+    /// by the percentage text. `state` is `(percent, battery::State)`.
+    fn draw_battery(
+        &self,
+        conn: &X11Connection,
+        rect: &Rectangle,
+        state: (u8, State),
+        fg: u32,
+        bg: u32,
+    ) -> Result<(), anyhow::Error> {
+        let (pct, st) = state;
+        let h = self.style.height;
+        let ix = rect.x + 2;
+        let iw: i16 = 18;
+        let ih: i16 = 9;
+        let iy = rect.y + ((h as i16 - ih) / 2);
+        let pct = pct.min(100) as f32;
+
+        // Outline (black border) + white interior.
+        conn.conn().change_gc(self.gc, &xproto::ChangeGCAux::new().foreground(fg))?;
+        conn.conn().poly_fill_rectangle(
+            self.window,
+            self.gc,
+            &[xproto::Rectangle {
+                x: ix - 1,
+                y: iy - 1,
+                width: (iw + 2) as u16,
+                height: (ih + 2) as u16,
+            }],
+        )?;
+        conn.conn().change_gc(self.gc, &xproto::ChangeGCAux::new().foreground(bg))?;
+        conn.conn().poly_fill_rectangle(
+            self.window,
+            self.gc,
+            &[xproto::Rectangle {
+                x: ix,
+                y: iy,
+                width: iw as u16,
+                height: ih as u16,
+            }],
+        )?;
+
+        // Charge fill (black), width proportional to percentage.
+        let fill_w = ((iw as f32 * pct / 100.0).round() as i16).max(if pct > 0.0 { 1 } else { 0 });
+        conn.conn().change_gc(self.gc, &xproto::ChangeGCAux::new().foreground(fg))?;
+        conn.conn().poly_fill_rectangle(
+            self.window,
+            self.gc,
+            &[xproto::Rectangle {
+                x: ix,
+                y: iy,
+                width: fill_w.max(0) as u16,
+                height: ih as u16,
+            }],
+        )?;
+
+        // Nub on the right.
+        conn.conn().poly_fill_rectangle(
+            self.window,
+            self.gc,
+            &[xproto::Rectangle {
+                x: ix + iw,
+                y: iy + 2,
+                width: 2,
+                height: (ih - 4).max(1) as u16,
+            }],
+        )?;
+
+        // Percentage text (with a '+' when charging, "FULL" when full).
+        let text = match st {
+            State::Charging => format!("{}+", pct as u8),
+            State::Full => "FULL".to_string(),
+            _ => format!("{}%", pct as u8),
+        };
+        let tx = ix + iw + 4;
+        let ty = rect.y + ((h as i16 + self.font.height() as i16) / 2) - self.font.descent() as i16;
+        self.font.draw_text_on_bg(conn.conn(), self.window, self.gc, tx, ty, &text, fg, bg)?;
 
         Ok(())
     }

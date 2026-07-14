@@ -68,7 +68,7 @@ impl FbSlit {
             0,
             &xproto::CreateWindowAux::new()
                 .override_redirect(1)
-                .background_pixel(conn.screen().white_pixel)
+                .background_pixel(crate::hooks::or(&crate::hooks::SLIT_BG, conn.screen().white_pixel))
                 .event_mask(
                     EventMask::EXPOSURE
                         | EventMask::SUBSTRUCTURE_NOTIFY
@@ -80,13 +80,17 @@ impl FbSlit {
         conn.conn().create_gc(
             gc,
             window,
-            &xproto::CreateGCAux::new().foreground(conn.screen().black_pixel),
+            &xproto::CreateGCAux::new().foreground(crate::hooks::or(&crate::hooks::SLIT_FG, conn.screen().black_pixel)),
         )?;
+
+        if let Some(cb) = crate::hooks::AFTER_SLIT_CREATE.get() {
+            cb(conn, window, 1, 1);
+        }
 
         Ok(Self {
             window,
             gc,
-            bg_pixel: conn.screen().white_pixel,
+            bg_pixel: crate::hooks::or(&crate::hooks::SLIT_BG, conn.screen().white_pixel),
             screen_width,
             screen_height,
             style,
