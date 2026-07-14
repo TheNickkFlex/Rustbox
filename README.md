@@ -2,13 +2,6 @@
 
 A fluxbox-based window manager written entirely in **Rust** (X11).
 
-## **BIG UPDATE COMING SOON**
-
-**• A lot of bugs and leaks solved**
-
-**• More performance, better appearance**
-
-*MUCH MORE COMING SOON!, HOOOPEE*
 
 ## Beta Preview - *No Wallpaper Mode (Less Resource Usage, More About In Compile-time features)*
 
