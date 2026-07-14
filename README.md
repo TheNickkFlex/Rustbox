@@ -35,7 +35,7 @@ running.
 - **Built-in notifications.** `org.freedesktop.Notifications` + dunstctl,
   rules, markup, icons, progress bars, stack tags — all inside the WM.
 
-## Resource usage
+## Resource usage - No Wallpaper mode
 
 Average footprint of the release build measured **idle** (no managed windows)
 on a virtual X server (Xephyr, 1024×768). VRAM is the X server-side footprint
