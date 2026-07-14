@@ -95,6 +95,10 @@ impl FbTray {
             &xproto::CreateGCAux::new().foreground(conn.screen().black_pixel),
         )?;
 
+        if let Some(cb) = crate::hooks::AFTER_TRAY_CREATE.get() {
+            cb(conn, window, 1, 1);
+        }
+
         Ok(Self {
             window,
             popup_window,
@@ -547,10 +551,11 @@ impl FbTray {
         let slots = visible + sni + if chevron { 1 } else { 0 };
         let w = (slots as i16) * self.icon_size as i16;
 
+        let bg = crate::hooks::or(&crate::hooks::TRAY_BG, self.bg_pixel);
         conn.conn().change_gc(
             self.gc,
             &xproto::ChangeGCAux::new()
-                .foreground(self.bg_pixel)
+                .foreground(bg)
                 .line_width(0),
         )?;
         conn.conn().poly_fill_rectangle(
@@ -576,7 +581,7 @@ impl FbTray {
             conn.conn().change_gc(
                 self.gc,
                 &xproto::ChangeGCAux::new()
-                    .foreground(self.fg_pixel)
+                    .foreground(crate::hooks::or(&crate::hooks::TRAY_FG, self.fg_pixel))
                     .line_width(2),
             )?;
             conn.conn().poly_line(
@@ -606,9 +611,10 @@ impl FbTray {
         }
         let w = self.icon_size;
         let h = (ov as i16) * self.icon_size as i16;
+        let bg = crate::hooks::or(&crate::hooks::TRAY_BG, self.bg_pixel);
         conn.conn().change_gc(
             self.gc,
-            &xproto::ChangeGCAux::new().foreground(self.bg_pixel),
+            &xproto::ChangeGCAux::new().foreground(bg),
         )?;
         let _ = conn.conn().poly_fill_rectangle(
             self.popup_window,

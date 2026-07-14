@@ -56,6 +56,7 @@ pub struct FbWinFrame {
     pub maximized: bool,
     pub shaded: bool,
     pub focused: bool,
+    pub no_maximize: bool,
     texture: Texture,
     gc: Option<xproto::Gcontext>,
     font: Font,
@@ -214,6 +215,7 @@ impl FbWinFrame {
             maximized: false,
             shaded: false,
             focused: false,
+            no_maximize: false,
             texture: Texture::new(),
             gc: Some(gc),
             font,
@@ -221,23 +223,30 @@ impl FbWinFrame {
             resize_cursor,
         };
         frame_.layout_buttons();
+        if let Some(cb) = crate::hooks::AFTER_FRAME_CREATE.get() {
+            let fh = height.saturating_add(title_height).saturating_add(border_width * 2);
+            cb(conn, frame, width, fh);
+        }
         Ok(frame_)
     }
 
     pub fn layout_buttons(&mut self) {
         self.buttons.clear();
-        let x_start = (self.width.saturating_sub(3 * (BTN_SIZE + BTN_GAP as u16) + 2)) as i16;
+        let count = if self.no_maximize { 2u16 } else { 3u16 };
+        let x_start = (self.width.saturating_sub(count * (BTN_SIZE + BTN_GAP as u16) + 2)) as i16;
         let y = 3i16;
         self.buttons.push(FrameButton::new(ButtonType::Iconify, x_start, y, BTN_SIZE));
-        self.buttons.push(FrameButton::new(
-            ButtonType::Maximize,
-            x_start + (BTN_SIZE as i16 + BTN_GAP),
-            y,
-            BTN_SIZE,
-        ));
+        if !self.no_maximize {
+            self.buttons.push(FrameButton::new(
+                ButtonType::Maximize,
+                x_start + (BTN_SIZE as i16 + BTN_GAP),
+                y,
+                BTN_SIZE,
+            ));
+        }
         self.buttons.push(FrameButton::new(
             ButtonType::Close,
-            x_start + 2 * (BTN_SIZE as i16 + BTN_GAP),
+            x_start + (count - 1) as i16 * (BTN_SIZE as i16 + BTN_GAP),
             y,
             BTN_SIZE,
         ));
@@ -320,6 +329,14 @@ impl FbWinFrame {
 
         self.configure_handle(conn)?;
         self.layout_buttons();
+        if let Some(cb) = crate::hooks::AFTER_FRAME_RESIZE.get() {
+            let fh = if self.shaded {
+                self.title_height + self.border_width * 2
+            } else {
+                height.saturating_add(self.title_height).saturating_add(self.border_width * 2)
+            };
+            cb(conn, self.frame_window, width, fh);
+        }
         Ok(())
     }
 
@@ -350,6 +367,9 @@ impl FbWinFrame {
         )?;
         self.configure_handle(conn)?;
         self.layout_buttons();
+        if let Some(cb) = crate::hooks::AFTER_FRAME_RESIZE.get() {
+            cb(conn, self.frame_window, w, fh);
+        }
         Ok(())
     }
 
@@ -363,10 +383,18 @@ impl FbWinFrame {
         Ok(())
     }
 
-    pub fn show(&self, conn: &X11Connection) -> Result<(), anyhow::Error> {
+    pub fn show(&mut self, conn: &X11Connection) -> Result<(), anyhow::Error> {
         self.configure_handle(conn)?;
         conn.conn().map_window(self.frame_window)?;
         conn.conn().map_window(self.title_window)?;
+        if !self.shaded {
+            let _ = conn.conn().map_window(self.handle_window);
+        }
+        // Repaint the titlebar: after being iconified the decoration windows
+        // were unmapped and would otherwise show their blank white background
+        // when remapped. The iconified flag toggled, so draw_titlebar will not
+        // early-return here.
+        self.draw_titlebar(conn)?;
         Ok(())
     }
 
@@ -427,16 +455,21 @@ impl FbWinFrame {
         Ok(())
     }
 
-    pub fn draw_titlebar(&self, conn: &X11Connection) -> Result<(), anyhow::Error> {
+    pub fn draw_titlebar(&mut self, conn: &X11Connection) -> Result<(), anyhow::Error> {
         let gc = match self.gc {
             Some(g) => g,
             None => return Ok(()),
         };
 
+        let default = conn.screen().white_pixel;
         let (fg, bg) = if self.focused {
-            (conn.screen().white_pixel, conn.screen().black_pixel)
+            let fg = crate::hooks::or(&crate::hooks::FRAME_FOCUSED_FG, default);
+            let bg = crate::hooks::or(&crate::hooks::FRAME_FOCUSED_BG, conn.screen().black_pixel);
+            (fg, bg)
         } else {
-            (conn.screen().black_pixel, conn.screen().white_pixel)
+            let fg = crate::hooks::or(&crate::hooks::FRAME_FG, conn.screen().black_pixel);
+            let bg = crate::hooks::or(&crate::hooks::FRAME_BG, default);
+            (fg, bg)
         };
 
         conn.conn().change_gc(gc, &xproto::ChangeGCAux::new().foreground(bg))?;
@@ -459,23 +492,7 @@ impl FbWinFrame {
         let btn_right = self.buttons.last().map(|b| b.rect.right()).unwrap_or(6);
         let avail = (btn_right - 6).max(4);
         if !self.label.is_empty() {
-            let mut disp = self.label.clone();
-            let full_w = self.font.text_width(conn.conn(), &disp).unwrap_or(0) as i16;
-            if full_w > avail {
-                let ellipsis_w = self.font.text_width(conn.conn(), "…").unwrap_or(8) as i16;
-                let target = avail.saturating_sub(ellipsis_w);
-                let n = disp.len();
-                let mut lo = 0usize;
-                let mut hi = n;
-                while lo < hi {
-                    let mid = (lo + hi + 1) / 2;
-                    let prefix: String = disp.chars().take(mid).collect();
-                    let w = self.font.text_width(conn.conn(), &prefix).unwrap_or(0) as i16;
-                    if w <= target { lo = mid; } else { hi = mid - 1; }
-                }
-                disp = disp.chars().take(lo).collect();
-                disp.push('…');
-            }
+            let disp = self.font.truncate_ellipsis(&self.label, avail);
             let ty = self.title_height as i16 / 2 + self.font.height() as i16 / 2
                 - self.font.descent() as i16;
             self.font.draw_text_on_bg(conn.conn(), self.title_window, gc, 4, ty, &disp, fg, bg)?;

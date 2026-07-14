@@ -141,13 +141,16 @@ impl Menu {
             screen_height,
             font,
             gc,
-            fg_pixel: fg,
-            bg_pixel: bg,
-            sel_pixel: fg,             // selected/highlight background = fg
-            hi_pixel: bg,              // highlight text colour = bg
+            fg_pixel: crate::hooks::or(&crate::hooks::MENU_FG, fg),
+            bg_pixel: crate::hooks::or(&crate::hooks::MENU_BG, bg),
+            sel_pixel: crate::hooks::or(&crate::hooks::MENU_SEL, fg),
+            hi_pixel: crate::hooks::or(&crate::hooks::MENU_HI, bg),
         };
 
         m.update_layout(conn)?;
+        if let Some(cb) = crate::hooks::AFTER_MENU_CREATE.get() {
+            cb(conn, win, m.width, m.height);
+        }
         Ok(m)
     }
 

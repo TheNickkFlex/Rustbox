@@ -44,9 +44,18 @@ impl Rustbox {
 
         rustbox.init_screens()?;
         log::info!("Rustbox::new: init_screens ok");
-        rustbox.notify = Some(NotifyDaemon::new(&rustbox.conn));
+
+        // Create the notification channel before anything else so the zbus
+        // thread and the in-process sender can share it.
+        let (notify_tx, notify_rx) = std::sync::mpsc::channel();
+        let _ = crate::notify::NOTIFY_SENDER.set(notify_tx.clone());
+
+        // Signal channel for emitting D-Bus signals from the zbus thread.
+        let (signal_tx, signal_rx) = futures_channel::mpsc::unbounded();
+
+        rustbox.notify = Some(NotifyDaemon::new(&rustbox.conn, notify_rx, signal_tx));
         log::info!("Rustbox::new: notify ok");
-        match SniManager::new() {
+        match SniManager::new(notify_tx, signal_rx) {
             Ok(sni) => {
                 let activator = sni.activator();
                 for screen in rustbox.screens.iter_mut() {
@@ -63,7 +72,9 @@ impl Rustbox {
     fn init_screens(&mut self) -> Result<(), anyhow::Error> {
         use x11rb::protocol::xproto::{ChangeWindowAttributesAux, EventMask};
 
+        crate::screen::trace_step("init_screens: BScreen::new ...");
         let bscreen = BScreen::new(0, self.conn.clone(), "default", self.running.clone())?;
+        crate::screen::trace_step("init_screens: BScreen::new done");
 
         self.conn.conn().change_window_attributes(
             self.conn.root_window(),
@@ -468,14 +479,11 @@ impl Rustbox {
                 }
             }
 
-            // Drain and dispatch any pending D-Bus notification messages, then
-            // sweep for expired notifications. `process_dbus` is non-blocking
-            // (uses a zero-timeout libdbus read). The next iteration's
-            // poll_for_event drains X events; the clock check fires on timeout.
+            // Drain and dispatch in-process channel notifications, then
+            // sweep for expired notifications.
             if let Some(n) = self.notify.as_mut() {
                 let conn = &self.conn;
                 let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    n.process_dbus(conn);
                     n.process_internal(conn);
                     n.tick(conn);
                 }));

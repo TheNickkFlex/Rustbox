@@ -2,12 +2,8 @@
 //!
 //! Implements the freedesktop.org Desktop Notifications spec
 //! (`org.freedesktop.Notifications`) by owning that well-known name on the
-//! session bus. The D-Bus connection runs on the WM's main thread: each event
-//! loop iteration drains pending messages via a non-blocking `incoming(0)`
-//! call, so no extra thread or wake pipe is required.
-//!
-//! Rendering is intentionally lightweight: popups are override-redirect X11
-//! windows drawn with the WM's bitmap font and X core primitives (no cairo).
+//! session bus. The D-Bus interface runs on the same async thread as the SNI
+//! tray icons, communicating with the main thread via channels.
 
 pub mod render;
 
@@ -17,12 +13,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::OnceLock;
 use std::time::Instant;
 
-use dbus::arg::Variant;
-use dbus::ffidisp::Connection as DbusConn;
-use dbus::message::Message;
-use dbus::strings::ErrorName;
-use dbus::MessageType;
 use regex::Regex;
+use zbus::interface;
 
 use crate::render::image::ImageControl;
 
@@ -44,8 +36,160 @@ pub enum NotifyCommand {
 /// Global sender side of the in-process notification channel. Initialized once
 /// when the daemon is created; any Rust code can grab it via
 /// [`NotifyDaemon::channel`] to raise notifications without D-Bus.
-static NOTIFY_SENDER: OnceLock<Sender<NotifyCommand>> = OnceLock::new();
+pub static NOTIFY_SENDER: OnceLock<Sender<NotifyCommand>> = OnceLock::new();
+
+/// Events sent from the main thread to the zbus async thread for emitting
+/// D-Bus signals on the session bus.
+#[derive(Debug, Clone)]
+pub enum SignalEvent {
+    NotificationClosed { id: u32, reason: u32 },
+    ActionInvoked { id: u32, action_key: String },
+}
+
 use crate::x11::X11Connection;
+
+/// The `org.freedesktop.Notifications` D-Bus interface, served on the async
+/// zbus thread. Converts incoming D-Bus method calls into `NotifyCommand`
+/// values sent to the main thread.
+pub(crate) struct NotificationsHandler {
+    notify_tx: Sender<NotifyCommand>,
+    next_id: u32,
+}
+
+#[interface(name = "org.freedesktop.Notifications")]
+impl NotificationsHandler {
+    async fn get_capabilities(&self) -> Vec<&str> {
+        vec![
+            "body",
+            "actions",
+            "icon-static",
+            "persistence",
+            "image/png",
+            "urgency",
+            "x-canonical-private-synchronous",
+            "x-dunst-stack-tag",
+        ]
+    }
+
+    async fn get_server_information(&self) -> Vec<String> {
+        vec![
+            "rustbox".into(),
+            "rustbox".into(),
+            "1.4.0".into(),
+            "1.2".into(),
+        ]
+    }
+
+    async fn notify(
+        &mut self,
+        app_name: String,
+        replaces_id: u32,
+        app_icon: String,
+        summary: String,
+        body: String,
+        actions: Vec<String>,
+        hints: std::collections::HashMap<String, zbus::zvariant::Value<'_>>,
+        expire: i32,
+        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+    ) -> u32 {
+        let parsed = parse_hints_zbus(&hints);
+        let replace_key = parsed.sync_key.as_ref().or(parsed.stack_tag.as_ref());
+        let id = if replaces_id != 0 {
+            replaces_id
+        } else {
+            let id = self.next_id;
+            self.next_id = self.next_id.wrapping_add(1).max(1);
+            id
+        };
+
+        let app_icon = if !app_icon.is_empty() {
+            app_icon
+        } else if let Some(p) = &parsed.image_path {
+            p.clone()
+        } else if let Some(de) = &parsed.desktop_entry {
+            resolve_theme_icon(de).unwrap_or_default()
+        } else if !app_name.is_empty() {
+            resolve_theme_icon(&app_name).unwrap_or_default()
+        } else {
+            String::new()
+        };
+
+        let notif = RawNotification {
+            id,
+            app_name,
+            app_icon,
+            summary,
+            body,
+            actions: pair_actions(&actions),
+            urgency: parsed.urgency,
+            transient: parsed.transient,
+            expire_timeout: expire,
+            created: Instant::now(),
+            icon_data: parsed.image_data,
+            sync_key: parsed.sync_key,
+            stack_tag: parsed.stack_tag,
+            category: parsed.category,
+            desktop_entry: parsed.desktop_entry,
+            progress: parsed.progress,
+            history_ignore: false,
+        };
+
+        log::info!(
+            "Notification #{} summary={} actions={} urgency={:?}",
+            id, notif.summary, notif.actions.len(), notif.urgency,
+        );
+
+        let _ = self.notify_tx.send(NotifyCommand::Notify(notif));
+        id
+    }
+
+    async fn close_notification(&mut self, id: u32) {
+        let _ = self.notify_tx.send(NotifyCommand::Close(id));
+    }
+}
+
+impl NotificationsHandler {
+    pub fn new(notify_tx: Sender<NotifyCommand>) -> Self {
+        Self {
+            notify_tx,
+            next_id: 1,
+        }
+    }
+}
+
+/// Emit a `NotificationClosed` D-Bus signal via the zbus connection.
+pub(crate) async fn emit_closed_signal(
+    conn: &zbus::Connection,
+    id: u32,
+    reason: u32,
+) {
+    let _ = conn
+        .emit_signal(
+            None::<&str>,
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications",
+            "NotificationClosed",
+            &(id, reason),
+        )
+        .await;
+}
+
+/// Emit an `ActionInvoked` D-Bus signal via the zbus connection.
+pub(crate) async fn emit_action_signal(
+    conn: &zbus::Connection,
+    id: u32,
+    action_key: &str,
+) {
+    let _ = conn
+        .emit_signal(
+            None::<&str>,
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications",
+            "ActionInvoked",
+            &(id, action_key),
+        )
+        .await;
+}
 
 /// Where on the screen notifications stack from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -243,15 +387,16 @@ impl Config {
     }
 }
 
-/// The notification daemon. Owns the D-Bus session name (when available) and
-/// the popup windows. It also exposes an in-process Rust channel (`NotifyCommand`)
-/// so notifications can be raised without D-Bus.
+/// The notification daemon. Owns the popup windows and the in-process
+/// notification channel. D-Bus integration lives on the async zbus thread;
+/// this struct only receives `NotifyCommand` values over a sync channel.
 pub struct NotifyDaemon {
-    /// D-Bus session connection. `None` when no session bus is available — the
-    /// daemon still works via the in-process channel in that case.
-    dbus: Option<DbusConn>,
-    /// Receiver end of the in-process notification channel.
+    /// Receiver end of the in-process notification channel (fed by both the
+    /// zbus async thread and direct Rust code via `NOTIFY_SENDER`).
     recv: Receiver<NotifyCommand>,
+    /// zbus thread signal sender — used to emit `NotificationClosed` /
+    /// `ActionInvoked` D-Bus signals from the main thread.
+    signal_tx: Option<futures_channel::mpsc::UnboundedSender<SignalEvent>>,
     next_id: u32,
     config: Config,
     paused: bool,
@@ -270,48 +415,20 @@ pub struct NotifyDaemon {
 }
 
 impl NotifyDaemon {
-    /// Create the notification daemon. The D-Bus `org.freedesktop.Notifications`
-    /// name is claimed when a session bus is available; otherwise the daemon
-    /// runs D-Bus-free and notifications are delivered only through the
-    /// in-process Rust channel. Always returns a usable daemon.
-    pub fn new(conn: &X11Connection) -> Self {
-        let dbus = match DbusConn::new_session() {
-            Ok(c) => {
-                match c.register_name("org.freedesktop.Notifications", 1 | 2) {
-                    Ok(reply) => {
-                        log::info!("Claimed org.freedesktop.Notifications (reply={:?})", reply)
-                    }
-                    Err(e) => log::warn!("Could not claim org.freedesktop.Notifications: {}", e),
-                }
-                // Register the object paths so libdbus routes method calls to
-                // our message queue instead of auto-replying with "UnknownMethod".
-                if let Err(e) = c.register_object_path("/org/freedesktop/Notifications") {
-                    log::warn!("Failed to register notification object path: {}", e);
-                }
-                if let Err(e) = c.register_object_path("/org/dunstproject/cmd0") {
-                    log::warn!("Failed to register dunst control object path: {}", e);
-                }
-                Some(c)
-            }
-            Err(e) => {
-                log::warn!(
-                    "D-Bus session unavailable; notifications work via in-process channel only: {}",
-                    e
-                );
-                None
-            }
-        };
-
-        // In-process Rust channel: the Sender side is published globally so any
-        // Rust code can raise notifications without D-Bus.
-        let (tx, rx) = channel::<NotifyCommand>();
-        let _ = NOTIFY_SENDER.set(tx);
-
+    /// Create the notification daemon. Consumes the receiver end of the
+    /// notification channel and the signal sender to the zbus thread.
+    /// The in-process `NOTIFY_SENDER` must be initialised beforehand so that
+    /// `NotificationBuilder::show()` and friends work immediately.
+    pub fn new(
+        conn: &X11Connection,
+        recv: Receiver<NotifyCommand>,
+        signal_tx: futures_channel::mpsc::UnboundedSender<SignalEvent>,
+    ) -> Self {
         let screen = conn.screen();
         let config = Self::load_config(&Self::config_path());
         let mut d = Self {
-            dbus,
-            recv: rx,
+            recv,
+            signal_tx: Some(signal_tx),
             next_id: 1,
             config,
             paused: false,
@@ -340,35 +457,12 @@ impl NotifyDaemon {
         self.screen_height = h;
     }
 
-    /// Drain and dispatch any pending D-Bus messages. Non-blocking: with a
-    /// zero timeout libdbus only processes already-buffered messages. No-op
-    /// when the daemon runs without a D-Bus session.
-    pub fn process_dbus(&mut self, conn: &X11Connection) {
-        let db = match self.dbus.as_ref() {
-            Some(db) => db,
-            None => return,
-        };
-        let mut msgs = Vec::new();
-        loop {
-            match db.incoming(0).next() {
-                Some(msg) if msg.msg_type() == MessageType::MethodCall => msgs.push(msg),
-                Some(_) => {}
-                None => break,
-            }
-        }
-        for msg in msgs {
-            self.handle_method_call(msg, conn);
-        }
-    }
-
     /// Drain and dispatch notifications delivered through the in-process Rust
-    /// channel (the D-Bus-free alternative). Runs once per main-loop iteration.
+    /// channel. Runs once per main-loop iteration.
     pub fn process_internal(&mut self, conn: &X11Connection) {
         while let Ok(cmd) = self.recv.try_recv() {
             match cmd {
                 NotifyCommand::Notify(mut notif) => {
-                    // Assign a stable id (the D-Bus path does this in
-                    // handle_method_call; the channel path must do it here).
                     if notif.id == 0 {
                         notif.id = self.next_id;
                         self.next_id = self.next_id.wrapping_add(1).max(1);
@@ -386,162 +480,10 @@ impl NotifyDaemon {
         }
     }
 
-    /// Send a D-Bus message only when a session bus is present.
-    fn dbus_send(&self, msg: Message) {
-        if let Some(db) = &self.dbus {
-            let _ = db.send(msg);
-        }
-    }
-
-    fn handle_method_call(&mut self, msg: Message, conn: &X11Connection) {
-        let iface = msg.interface().map(|s| s.to_string());
-        let member = msg.member().map(|s| s.to_string());
-        let (iface, member) = match (iface, member) {
-            (Some(i), Some(m)) => (i, m),
-            _ => return,
-        };
-
-        match (iface.as_str(), member.as_str()) {
-            ("org.freedesktop.Notifications", "GetCapabilities") => {
-                let caps = vec![
-                    "body",
-                    "actions",
-                    "icon-static",
-                    "persistence",
-                    "image/png",
-                    "urgency",
-                    "x-canonical-private-synchronous",
-                    "x-dunst-stack-tag",
-                ];
-                let _ = self.dbus_send(msg.method_return().append1(caps));
-            }
-            ("org.freedesktop.Notifications", "GetServerInformation") => {
-                let _ = self.dbus_send(
-                    msg.method_return()
-                        .append3("rustbox", "rustbox", "1.4.0")
-                        .append1("1.2"),
-                );
-            }
-            ("org.dunstproject.cmd0", m) => {
-                self.handle_control(m, msg, conn);
-            }
-            ("org.freedesktop.Notifications", "Notify") => {
-                let mut iter = msg.iter_init();
-                let app_name: String = iter.read().unwrap_or_default();
-                let replaces_id: u32 = iter.read().unwrap_or_default();
-                let app_icon: String = iter.read().unwrap_or_default();
-                let summary: String = iter.read().unwrap_or_default();
-                let body: String = iter.read().unwrap_or_default();
-                let actions: Vec<String> = iter.read().unwrap_or_default();
-                let hints: HashMap<String, Variant<Box<dyn dbus::arg::RefArg>>> = iter.read().unwrap_or_default();
-                let expire: i32 = iter.read().unwrap_or_default();
-
-                let h = parse_hints(&hints);
-                let urgency = h.urgency;
-                let transient = h.transient;
-
-                // Resolve the replacement id: explicit `replaces_id`, else a
-                // matching `x-canonical-private-synchronous` key or a matching
-                // `x-dunst-stack-tag` (both group/merge by key).
-                let replace_key = h.sync_key.as_ref().or(h.stack_tag.as_ref());
-                let replaces_id = if replaces_id != 0 {
-                    replaces_id
-                } else if let Some(key) = replace_key {
-                    self.sync_map.get(key).copied().unwrap_or(0)
-                } else {
-                    0
-                };
-
-                let id = if replaces_id != 0 {
-                    replaces_id
-                } else {
-                    let id = self.next_id;
-                    self.next_id = self.next_id.wrapping_add(1).max(1);
-                    id
-                };
-
-                // Resolve the icon: explicit path > image-path hint > theme
-                // lookup via desktop-entry > theme lookup via app name.
-                let app_icon = if !app_icon.is_empty() {
-                    app_icon.clone()
-                } else if let Some(p) = &h.image_path {
-                    p.clone()
-                } else if let Some(de) = &h.desktop_entry {
-                    resolve_theme_icon(de).unwrap_or_default()
-                } else if !app_name.is_empty() {
-                    resolve_theme_icon(&app_name).unwrap_or_default()
-                } else {
-                    String::new()
-                };
-                let icon_data = h.image_data.clone();
-
-                // Track the grouping key (sync_key OR stack_tag) so a later
-                // notification with the same key replaces this one.
-                if let Some(key) = replace_key {
-                    self.sync_map.insert(key.clone(), id);
-                }
-
-                let notif = RawNotification {
-                    id,
-                    app_name: app_name.clone(),
-                    app_icon,
-                    summary: summary.clone(),
-                    body: body.clone(),
-                    actions: pair_actions(&actions),
-                    urgency,
-                    transient,
-                    expire_timeout: expire,
-                    created: Instant::now(),
-                    icon_data,
-                    sync_key: h.sync_key.clone(),
-                    stack_tag: h.stack_tag.clone(),
-                    category: h.category.clone(),
-                    desktop_entry: h.desktop_entry.clone(),
-                    progress: h.progress,
-                    history_ignore: false,
-                };
-                log::info!(
-                    "Notification #{} app={} summary={} body={} actions={} urgency={:?} transient={}",
-                    id,
-                    app_name,
-                    summary,
-                    body,
-                    notif.actions.len(),
-                    urgency,
-                    transient,
-                );
-
-                if let Some(pos) = self.displayed.iter().position(|p| p.notif.id == id) {
-                    let old = self.displayed.remove(pos);
-                    old.destroy(conn);
-                }
-                self.enqueue(notif, conn);
-
-                let _ = self.dbus_send(msg.method_return().append1(id));
-            }
-            ("org.freedesktop.Notifications", "CloseNotification") => {
-                let id: u32 = msg.read1().unwrap_or(0);
-                self.close(id, CloseReason::ClosedByCaller, conn);
-                let _ = self.dbus_send(msg.method_return());
-            }
-            _ => {
-                let name = ErrorName::new("org.freedesktop.DBus.Error.UnknownMethod").unwrap();
-                let _ = self.dbus_send(msg.error(&name, c"no such method"));
-            }
-        }
-    }
-
-    /// Add a notification to the displayed set or the waiting queue.
     fn enqueue(&mut self, mut notif: RawNotification, conn: &X11Connection) {
         let skip = Self::apply_rules(&mut notif, &self.config.rules);
         if skip {
-            if let Ok(sig) = Message::new_signal(
-                "/org/freedesktop/Notifications",
-                "org.freedesktop.Notifications",
-                "NotificationClosed",
-            ) {
-                let _ = self.dbus_send(sig.append2(notif.id, CloseReason::Undefined as u32));
-            }
+            self.emit_closed(notif.id, CloseReason::Undefined);
             if !notif.history_ignore {
                 notif.icon_data = None; // Strip heavy raw image bytes before saving to history
                 self.history.push(notif);
@@ -701,125 +643,21 @@ impl NotifyDaemon {
     }
 
     fn emit_closed(&self, id: u32, reason: CloseReason) {
-        if let Ok(sig) = Message::new_signal(
-            "/org/freedesktop/Notifications",
-            "org.freedesktop.Notifications",
-            "NotificationClosed",
-        ) {
-            let _ = self.dbus_send(sig.append2(id, reason as u32));
+        if let Some(tx) = &self.signal_tx {
+            let _ = tx.unbounded_send(SignalEvent::NotificationClosed {
+                id,
+                reason: reason as u32,
+            });
         }
     }
 
     fn emit_action(&self, id: u32, action_key: &str) {
-        if let Ok(sig) = Message::new_signal(
-            "/org/freedesktop/Notifications",
-            "org.freedesktop.Notifications",
-            "ActionInvoked",
-        ) {
-            let _ = self.dbus_send(sig.append2(id, action_key.to_string()));
+        if let Some(tx) = &self.signal_tx {
+            let _ = tx.unbounded_send(SignalEvent::ActionInvoked {
+                id,
+                action_key: action_key.to_string(),
+            });
         }
-    }
-
-    /// Handle the `org.dunstproject.cmd0` control interface (a `dunstctl`
-    /// compatible subset).
-    fn handle_control(&mut self, member: &str, msg: Message, conn: &X11Connection) {
-        match member {
-            "ping" => {
-                let _ = self.dbus_send(msg.method_return().append1("pong"));
-            }
-            "pause" => {
-                self.set_paused(true);
-                let _ = self.dbus_send(msg.method_return());
-            }
-            "resume" => {
-                self.set_paused(false);
-                let _ = self.dbus_send(msg.method_return());
-            }
-            "isPaused" => {
-                let _ = self.dbus_send(msg.method_return().append1(self.paused()));
-            }
-            "closeAll" => {
-                let ids: Vec<u32> = self.displayed.iter().map(|p| p.notif.id).collect();
-                for id in ids {
-                    self.close(id, CloseReason::User, conn);
-                }
-                let _ = self.dbus_send(msg.method_return());
-            }
-            "close" => {
-                let id: u32 = msg.read1().unwrap_or(0);
-                self.close(id, CloseReason::ClosedByCaller, conn);
-                let _ = self.dbus_send(msg.method_return());
-            }
-            "closeLast" => {
-                if let Some(id) = self.displayed.last().map(|p| p.notif.id) {
-                    self.close(id, CloseReason::User, conn);
-                }
-                let _ = self.dbus_send(msg.method_return());
-            }
-            "historyCount" => {
-                let _ = self.dbus_send(msg.method_return().append1(self.history.len() as u32));
-            }
-            "clearHistory" => {
-                self.history.clear();
-                let _ = self.dbus_send(msg.method_return());
-            }
-            "removeFromHistory" => {
-                let id: u32 = msg.read1().unwrap_or(0);
-                self.history.retain(|n| n.id != id);
-                let _ = self.dbus_send(msg.method_return());
-            }
-            "popHistory" => {
-                // Re-display the most recent history entry if a slot is free.
-                if let Some(n) = self.history.pop() {
-                    self.enqueue(n, conn);
-                }
-                let _ = self.dbus_send(msg.method_return());
-            }
-            "configReload" => {
-                self.reload_config(conn);
-                let _ = self.dbus_send(msg.method_return());
-            }
-            "history" | "getHistory" => {
-                let hist: Vec<(u32, String, String, String, u32)> = self
-                    .history
-                    .iter()
-                    .map(|n| {
-                        (
-                            n.id,
-                            n.app_name.clone(),
-                            n.summary.clone(),
-                            n.body.clone(),
-                            n.urgency as u32,
-                        )
-                    })
-                    .collect();
-                let _ = self.dbus_send(msg.method_return().append1(hist));
-            }
-            "context" => {
-                let id: u32 = msg.read1().unwrap_or(0);
-                let actions: Vec<(String, String)> = self
-                    .displayed
-                    .iter()
-                    .find(|p| p.notif.id == id)
-                    .map(|p| p.notif.actions.clone())
-                    .or_else(|| {
-                        self.history
-                            .iter()
-                            .find(|n| n.id == id)
-                            .map(|n| n.actions.clone())
-                    })
-                    .unwrap_or_default();
-                let _ = self.dbus_send(msg.method_return().append2(id, actions));
-            }
-            _ => {
-                let name = ErrorName::new("org.freedesktop.DBus.Error.UnknownMethod").unwrap();
-                let _ = self.dbus_send(msg.error(&name, c"no such control method"));
-            }
-        }
-    }
-
-    pub fn set_paused(&mut self, paused: bool) {
-        self.paused = paused;
     }
 
     pub fn paused(&self) -> bool {
@@ -1180,100 +1018,88 @@ fn pair_actions(actions: &[String]) -> Vec<(String, String)> {
 }
 
 /// Extract the interesting fields from the `hints` dict of a `Notify` call.
-fn parse_hints(hints: &HashMap<String, Variant<Box<dyn dbus::arg::RefArg>>>) -> ParsedHints {
-    let mut out = ParsedHints {
-        urgency: Urgency::Normal,
-        ..Default::default()
-    };
+fn parse_hints_zbus(
+    hints: &std::collections::HashMap<String, zbus::zvariant::Value<'_>>,
+) -> ParsedHints {
+    use zbus::zvariant::Value;
+    let mut out = ParsedHints::default();
     for (k, v) in hints {
         match k.as_str() {
             "urgency" => {
-                if let Some(u) = v.0.as_u64() {
-                    out.urgency = Urgency::from_u32(u as u32);
+                if let Value::U32(u) = v {
+                    out.urgency = Urgency::from_u32(*u);
                 }
             }
             "transient" => {
-                if let Some(t) = v.0.as_u64() {
-                    out.transient = t != 0;
+                if let Value::Bool(t) = v {
+                    out.transient = *t;
                 }
             }
             "resident" => {
-                if let Some(t) = v.0.as_u64() {
-                    out.transient = !(t != 0);
+                if let Value::Bool(t) = v {
+                    out.transient = !*t;
                 }
             }
             "image-path" => {
-                if let Some(s) = v.0.as_str() {
+                if let Value::Str(s) = v {
                     out.image_path = Some(s.to_string());
                 }
             }
             "desktop-entry" => {
-                if let Some(s) = v.0.as_str() {
+                if let Value::Str(s) = v {
                     out.desktop_entry = Some(s.to_string());
                 }
             }
             "x-canonical-private-synchronous" => {
-                if let Some(s) = v.0.as_str() {
+                if let Value::Str(s) = v {
                     out.sync_key = Some(s.to_string());
                 }
             }
             "x-dunst-stack-tag" => {
-                if let Some(s) = v.0.as_str() {
+                if let Value::Str(s) = v {
                     out.stack_tag = Some(s.to_string());
                 }
             }
             "category" => {
-                if let Some(s) = v.0.as_str() {
+                if let Value::Str(s) = v {
                     out.category = Some(s.to_string());
                 }
             }
             "value" => {
-                if let Some(val) = v.0.as_u64() {
-                    out.progress = Some((val as u8).clamp(0, 100));
+                if let Value::U8(val) = v {
+                    out.progress = Some((*val).min(100));
                 }
             }
             "image-data" => {
-                if let Some(bytes) = decode_image_data(&v.0) {
-                    out.image_data = Some(bytes);
+                if let Value::Structure(data) = v {
+                    let f = data.fields();
+                    if f.len() >= 7 {
+                        let w = if let Value::I32(w) = &f[0] { *w as u32 } else { 0 };
+                        let h = if let Value::I32(h) = &f[1] { *h as u32 } else { 0 };
+                        let _rowstride = if let Value::I32(v) = &f[2] { *v } else { 0 };
+                        let _has_alpha = if let Value::Bool(v) = &f[3] { *v } else { true };
+                        let _bits = if let Value::I32(v) = &f[4] { *v } else { 0 };
+                        let samples = if let Value::I32(v) = &f[5] { *v as usize } else { 4 };
+                        if let Value::Array(arr) = &f[6] {
+                            let pixels: Vec<u8> = arr.iter().filter_map(|v| if let Value::U8(b) = v { Some(*b) } else { None }).collect();
+                            if w > 0 && h > 0 && samples >= 3 {
+                                let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+                                for px in pixels.chunks(samples) {
+                                    rgba.push(px[0]);
+                                    rgba.push(px[1]);
+                                    rgba.push(px[2]);
+                                    rgba.push(if samples >= 4 { px[3] } else { 0xff });
+                                }
+                                out.image_data = Some(rgba);
+                            }
+                        }
+                    }
                 }
             }
             _ => {}
         }
     }
     out
-}
-
-/// Decode the freedesktop `image-data` struct `(iiibiiay)` into RGBA8 pixels.
-/// Best-effort: any failure yields `None` and the icon is simply omitted.
-fn decode_image_data(value: &dyn dbus::arg::RefArg) -> Option<Vec<u8>> {
-    let mut iter = value.as_iter()?;
-    let w = iter.next()?.as_i64()? as u32;
-    let h = iter.next()?.as_i64()? as u32;
-    let _rowstride = iter.next()?.as_i64()?;
-    let alpha = iter.next()?.as_u64()? != 0;
-    let _bits = iter.next()?.as_i64()?;
-    let samples = iter.next()?.as_i64()? as usize;
-    let pixels: Vec<u8> = iter
-        .next()?
-        .as_iter()?
-        .filter_map(|a| a.as_u64().map(|x| x as u8))
-        .collect();
-    if w == 0 || h == 0 || samples < 3 {
-        return None;
-    }
-    let mut out = Vec::with_capacity((w * h * 4) as usize);
-    if samples == 4 {
-        out.extend_from_slice(&pixels);
-    } else {
-        // Expand RGB -> RGBA.
-        for px in pixels.chunks(samples) {
-            out.push(px[0]);
-            out.push(px[1]);
-            out.push(px[2]);
-            out.push(if alpha { *px.get(3).unwrap_or(&0xff) } else { 0xff });
-        }
-    }
-    Some(out)
 }
 
 /// Builder for complex notifications raised entirely in Rust, without D-Bus.
