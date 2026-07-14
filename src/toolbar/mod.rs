@@ -1,7 +1,7 @@
 use x11rb::connection::Connection;
 use x11rb::protocol::xproto::{self, EventMask, WindowClass, ConnectionExt as _};
 
-use battery::{Manager, State};
+use crate::battery::{read_battery, BatteryState};
 use crate::core::{Rectangle, Strut};
 use crate::render::font::Font;
 use crate::x11::X11Connection;
@@ -68,8 +68,7 @@ pub struct FbToolbar {
     /// drawn and no space is reserved.
     battery_width: i16,
     battery_rect: Rectangle,
-    battery_manager: Option<Manager>,
-    battery_state: Option<(u8, State)>,
+    battery_state: Option<(u8, BatteryState)>,
     last_battery_check: std::time::Instant,
 }
 
@@ -122,21 +121,12 @@ impl FbToolbar {
         log::debug!("toolbar font x_id present: {}", font.x_id().is_some());
 
         // Detect whether a battery exists so we only reserve space / draw the
-        // indicator on laptops. On desktops `Manager::new` or `batteries`
-        // fails and we simply skip it.
-        let (battery_manager, battery_width) = match Manager::new() {
-            Ok(mgr) => {
-                let has = mgr
-                    .batteries()
-                    .map(|mut b| b.next().is_some())
-                    .unwrap_or(false);
-                if has {
-                    (Some(mgr), 74)
-                } else {
-                    (None, 0)
-                }
-            }
-            Err(_) => (None, 0),
+        // indicator on laptops. On desktops `read_battery` returns `None` and we
+        // simply skip it. Uses the kernel sysfs interface, so it also works on
+        // Android/Termux (Bionic) where glibc-oriented crates fail.
+        let (battery_state, battery_width) = match read_battery() {
+            Some(s) => (Some(s), 74),
+            None => (None, 0),
         };
 
         let toolbar_h = (style.height + style.border_width * 2) as u16;
@@ -161,7 +151,6 @@ impl FbToolbar {
             tray_reserve: 0,
             battery_width,
             battery_rect: Rectangle::zero(),
-            battery_manager,
             battery_state: None,
             last_battery_check: std::time::Instant::now(),
         };
@@ -240,7 +229,7 @@ impl FbToolbar {
     /// Cheap no-op when no battery was detected at startup or when called more
     /// often than the interval. Safe to call every clock tick.
     pub fn refresh_battery(&mut self) {
-        if self.battery_manager.is_none() {
+        if self.battery_width == 0 {
             return;
         }
         let now = std::time::Instant::now();
@@ -248,20 +237,7 @@ impl FbToolbar {
             return;
         }
         self.last_battery_check = now;
-
-        let mgr = self.battery_manager.as_ref().unwrap();
-        let new_state = match mgr.batteries() {
-            Ok(mut batteries) => match batteries.next() {
-                Some(Ok(mut bat)) => {
-                    let _ = mgr.refresh(&mut bat);
-                    let pct = (bat.state_of_charge().value * 100.0).clamp(0.0, 100.0) as u8;
-                    Some((pct, bat.state()))
-                }
-                _ => None,
-            },
-            Err(_) => None,
-        };
-        self.battery_state = new_state;
+        self.battery_state = read_battery();
     }
 
     /// Replace the running-window list. Each entry is `(name, focused)`.
@@ -456,12 +432,12 @@ impl FbToolbar {
     }
 
     /// Draw a small battery glyph (outline + proportional fill + nub) followed
-    /// by the percentage text. `state` is `(percent, battery::State)`.
+    /// by the percentage text. `state` is `(percent, BatteryState)`.
     fn draw_battery(
         &self,
         conn: &X11Connection,
         rect: &Rectangle,
-        state: (u8, State),
+        state: (u8, BatteryState),
         fg: u32,
         bg: u32,
     ) -> Result<(), anyhow::Error> {
@@ -525,8 +501,8 @@ impl FbToolbar {
 
         // Percentage text (with a '+' when charging, "FULL" when full).
         let text = match st {
-            State::Charging => format!("{}+", pct as u8),
-            State::Full => "FULL".to_string(),
+            BatteryState::Charging => format!("{}+", pct as u8),
+            BatteryState::Full => "FULL".to_string(),
             _ => format!("{}%", pct as u8),
         };
         let tx = ix + iw + 4;

@@ -42,10 +42,6 @@ serde_json = "1"
 # Image loading — only the PNG decoder is needed (keeps the binary lean).
 image = { version = "0.25", default-features = false, features = ["png"] }
 
-# Battery status (library used by the toolbar indicator). Cross-platform;
-# reads /sys/class/power_supply on Linux. Gracefully absent on desktops.
-battery = "0.7"
-
 # Font rendering (TrueType outline rasterization + emoji)
 fontdb = "0.21"
 ab_glyph = "0.2"
