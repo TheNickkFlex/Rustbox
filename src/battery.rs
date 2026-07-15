@@ -104,25 +104,23 @@ fn read_termux() -> Option<BatteryReading> {
 }
 
 fn parse_termux_json(raw: &str) -> Option<BatteryReading> {
-    let pct = raw
-        .find("\"percentage\"")
-        .and_then(|i| raw[i..].find(':'))
-        .and_then(|i| {
-            let rest = raw[i + 1..].trim_start();
-            let end = rest.find(|c: char| !c.is_ascii_digit())?;
-            rest[..end].parse::<u8>().ok()
-        })?;
-    let state = raw
-        .find("\"status\"")
-        .and_then(|i| raw[i..].find(':'))
-        .and_then(|i| {
-            let rest = raw[i + 1..].trim_start();
-            let s = rest.trim_matches('"');
-            let end = s.find('"')?;
-            Some(&s[..end])
-        })
-        .map(termux_status_to_state)
-        .unwrap_or(BatteryState::Unknown);
+    let pct = {
+        let key_pos = raw.find("\"percentage\"")?;
+        let after_key = &raw[key_pos..];
+        let colon = after_key.find(':')?;
+        let rest = after_key[colon + 1..].trim_start();
+        let end = rest.find(|c: char| !c.is_ascii_digit())?;
+        rest[..end].parse::<u8>().ok()?
+    };
+    let state = {
+        let key_pos = raw.find("\"status\"")?;
+        let after_key = &raw[key_pos..];
+        let colon = after_key.find(':')?;
+        let rest = after_key[colon + 1..].trim_start();
+        let quoted = rest.strip_prefix('"')?;
+        let end = quoted.find('"')?;
+        termux_status_to_state(&quoted[..end])
+    };
     Some((pct.clamp(0, 100), state))
 }
 
