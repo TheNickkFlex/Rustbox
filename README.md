@@ -186,32 +186,6 @@ The `-socket` flag also works for direct X socket paths.
 The root menu launches **kitty** as the default terminal emulator. Make sure
 it is installed.
 
-### Testing inside a nested Xephyr
-
-To try Rustbox without touching your real session, use the helper script.
-It starts a nested Xephyr (on `:5` by default, using your current `$DISPLAY`
-as the host) and launches Rustbox against it — no manual `DISPLAY` juggling
-required:
-
-```bash
-# Wallpaper build (default)
-./scripts/test-xephyr.sh
-
-# No-wallpaper build
-./scripts/test-xephyr.sh nowp
-
-# Stop the test session
-./scripts/test-xephyr.sh kill
-
-# Inside the nested display, open a terminal:
-DISPLAY=:5 kitty &
-```
-
-> Note: Xephyr must be able to find a host X server, so run the script from a
-> normal X session (where `$DISPLAY` points at a real server such as `:0`).
-> If you see `Xephyr cannot open host display`, your `$DISPLAY` is not set or
-> points nowhere.
-
 ## Configuration
 
 | File                                   | Purpose                                             |
