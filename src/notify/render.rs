@@ -158,6 +158,10 @@ impl Popup {
         p.redraw(conn)?;
         c.map_window(window)?;
         c.flush()?;
+        log::debug!(
+            "Notification popup criado: window={:#x} x={} y={} w={} h={} app={} summary={}",
+            window, x, y, w, h, p.notif.app_name, p.notif.summary,
+        );
         if let Some(cb) = crate::hooks::AFTER_NOTIFY_CREATE.get() {
             cb(conn, window, w, h);
         }

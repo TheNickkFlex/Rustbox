@@ -56,6 +56,14 @@ pub struct ActivateRequest {
     pub y: i32,
 }
 
+/// A request from the WM (a tray right-click) to the SNI thread, which
+/// invokes `ContextMenu` on the StatusNotifierItem.
+pub struct ContextMenuRequest {
+    pub service: String,
+    pub x: i32,
+    pub y: i32,
+}
+
 /// Internal command from the served `Watcher` interface to the run loop.
 enum Command {
     Register { bus: String, path: String },
@@ -70,6 +78,10 @@ enum Command {
 trait StatusNotifierItem {
     /// Left click. `x`/`y` are the click position in root coordinates.
     fn activate(&self, x: i32, y: i32) -> zbus::Result<()>;
+    /// Middle click.
+    fn secondary_activate(&self, x: i32, y: i32) -> zbus::Result<()>;
+    /// Right click — show the app's context menu at `x`/`y`.
+    fn context_menu(&self, x: i32, y: i32) -> zbus::Result<()>;
     #[zbus(property)]
     fn icon_name(&self) -> zbus::Result<String>;
     /// `Vec` of `(width, height, ARGB32 bytes)` frames; apps usually send one.
@@ -151,6 +163,7 @@ impl Watcher {
 pub struct SniManager {
     rx: Receiver<SniEvent>,
     activate_tx: UnboundedSender<ActivateRequest>,
+    context_menu_tx: UnboundedSender<ContextMenuRequest>,
     wake_r: RawFd,
     _wake_w: RawFd,
 }
@@ -173,10 +186,11 @@ impl SniManager {
 
         let (to_wm_tx, to_wm_rx) = mpsc::channel();
         let (activate_tx, activate_rx) = futures_channel::mpsc::unbounded();
+        let (context_menu_tx, context_menu_rx) = futures_channel::mpsc::unbounded();
 
         thread::Builder::new().name("rustbox-sni".into()).spawn(move || {
             let res = smol::block_on(run_sni(
-                to_wm_tx, activate_rx, wake_w, notify_tx, signal_rx,
+                to_wm_tx, activate_rx, context_menu_rx, wake_w, notify_tx, signal_rx,
             ));
             if let Err(e) = res {
                 log::warn!("SNI: thread encerrou (tray moderna indisponível): {e}");
@@ -186,6 +200,7 @@ impl SniManager {
         Ok(Self {
             rx: to_wm_rx,
             activate_tx,
+            context_menu_tx,
             wake_r,
             _wake_w: wake_w,
         })
@@ -202,9 +217,18 @@ impl SniManager {
         self.rx.try_recv().ok()
     }
 
-    /// Ask the SNI thread to invoke `Activate` on `service` (a tray click).
+    /// Ask the SNI thread to invoke `Activate` on `service` (a tray left-click).
     pub fn activate(&self, service: &str, x: i32, y: i32) {
         let _ = self.activate_tx.unbounded_send(ActivateRequest {
+            service: service.to_string(),
+            x,
+            y,
+        });
+    }
+
+    /// Ask the SNI thread to invoke `ContextMenu` on `service` (a tray right-click).
+    pub fn context_menu(&self, service: &str, x: i32, y: i32) {
+        let _ = self.context_menu_tx.unbounded_send(ContextMenuRequest {
             service: service.to_string(),
             x,
             y,
@@ -215,6 +239,11 @@ impl SniManager {
     /// SNI thread. Stored on each screen so a tray click can reach the thread.
     pub fn activator(&self) -> UnboundedSender<ActivateRequest> {
         self.activate_tx.clone()
+    }
+
+    /// Clone of the channel used to forward right-click/context-menu requests.
+    pub fn context_menu_activator(&self) -> UnboundedSender<ContextMenuRequest> {
+        self.context_menu_tx.clone()
     }
 
     /// Drain the self-pipe so its buffer does not grow without bound (the WM
@@ -253,6 +282,7 @@ fn signal_pipe(fd: RawFd) {
 async fn run_sni(
     to_wm_tx: Sender<SniEvent>,
     mut activate_rx: UnboundedReceiver<ActivateRequest>,
+    mut context_menu_rx: UnboundedReceiver<ContextMenuRequest>,
     wake_w: RawFd,
     notify_tx: Sender<crate::notify::NotifyCommand>,
     mut signal_rx: futures_channel::mpsc::UnboundedReceiver<SignalEvent>,
@@ -287,6 +317,18 @@ async fn run_sni(
                 {
                     if let Err(e) = proxy.activate(req.x, req.y).await {
                         log::debug!("SNI: Activate em {} falhou: {e}", req.service);
+                    }
+                }
+            }
+            req = context_menu_rx.select_next_some() => {
+                if let Ok(proxy) = StatusNotifierItemProxy::builder(&conn)
+                    .destination(req.service.as_str())?
+                    .path("/StatusNotifierItem")?
+                    .build()
+                    .await
+                {
+                    if let Err(e) = proxy.context_menu(req.x, req.y).await {
+                        log::debug!("SNI: ContextMenu em {} falhou: {e}", req.service);
                     }
                 }
             }

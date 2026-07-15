@@ -39,6 +39,9 @@ pub struct FbTray {
     max_visible: usize,
     /// Screen-x of the tray's right edge (left edge of the clock minus gap).
     right_anchor: i16,
+    /// Screen-y of the toolbar's window origin (used by the popup, which is a
+    /// root child and needs screen-absolute coordinates).
+    toolbar_screen_y: i16,
     icons: Vec<TrayIcon>,
     sni_slots: Vec<SniSlot>,
     popup_open: bool,
@@ -49,20 +52,24 @@ impl FbTray {
         conn: &X11Connection,
         screen_width: u16,
         screen_height: u16,
+        toolbar_window: u32,
     ) -> Result<Self, anyhow::Error> {
         let icon_size = 24u16;
         let max_visible = 4usize;
 
+        // The tray window is a child of the toolbar so it is clipped to the
+        // toolbar area and inherits the toolbar background. It is NOT
+        // override-redirect — the toolbar itself is OR, and children of an OR
+        // window are automatically stacked above it.
         let window = conn.conn().generate_id()?;
         conn.conn().create_window(
             0,
             window,
-            conn.root_window(),
+            toolbar_window,
             0, 0, 1, 1, 0,
             WindowClass::INPUT_OUTPUT,
             0,
             &xproto::CreateWindowAux::new()
-                .override_redirect(1)
                 .background_pixel(conn.screen().white_pixel)
                 .event_mask(
                     EventMask::EXPOSURE
@@ -110,6 +117,7 @@ impl FbTray {
             icon_size,
             max_visible,
             right_anchor: 0,
+            toolbar_screen_y: 0,
             icons: Vec::new(),
             sni_slots: Vec::new(),
             popup_open: false,
@@ -151,6 +159,12 @@ impl FbTray {
     /// of the clock minus a gap). `BScreen` derives this from the toolbar.
     pub fn set_anchor(&mut self, anchor: i16) {
         self.right_anchor = anchor;
+    }
+
+    /// Store the toolbar's screen-y so the overflow popup (a root child) can
+    /// position itself correctly above the toolbar.
+    pub fn set_toolbar_screen_y(&mut self, y: i16) {
+        self.toolbar_screen_y = y;
     }
 
     /// Number of XEmbed icons shown before SNI slots and (optionally) the
@@ -244,6 +258,17 @@ impl FbTray {
                 .width(self.icon_size as u32)
                 .height(self.icon_size as u32),
         );
+
+        // Log the client geometry before reparenting (helps diagnose the
+        // stray white-square issue at the top-right).
+        if log::log_enabled!(log::Level::Debug) {
+            if let Ok(g) = conn.conn().get_geometry(client)?.reply() {
+                log::debug!(
+                    "Dock client {:#x} geom before reparent: x={} y={} w={} h={} parent={:#x}",
+                    client, g.x, g.y, g.width, g.height, g.root,
+                );
+            }
+        }
 
         // Reparent into the tray container; `reposition()` will place it.
         conn.conn().reparent_window(client, self.window, 0, 0)?;
@@ -354,6 +379,10 @@ impl FbTray {
             }
         };
         let img = img.scale(self.icon_size as u32, self.icon_size as u32)?;
+        // Composite against the toolbar/tray background (white by default) so
+        // transparent pixels blend correctly on depth-24 displays without a
+        // compositor.
+        let img = img.composite_on_bg(255, 255, 255);
         let pm = img.create_pixmap(conn.conn(), conn.screen(), self.window)?;
         if let Some(slot) = self.sni_slots.iter_mut().find(|s| s.service == service) {
             if let Some(old) = slot.pixmap {
@@ -361,6 +390,7 @@ impl FbTray {
             }
             slot.pixmap = Some(pm);
         }
+        self.reposition(conn)?;
         self.sni_redraw(conn)?;
         Ok(())
     }
@@ -429,9 +459,10 @@ impl FbTray {
         let tray_w = (slots as i16) * self.icon_size as i16;
         let tray_h = self.icon_size;
         let tray_x = self.right_anchor - tray_w;
-        // Bottom-align with the toolbar (height 24 + 2px border). Drop 2px
-        // so the tray sits snugly inside the toolbar.
-        let tray_y = (self.screen_height as i16) - (self.icon_size as i16) - 2;
+        // The tray is a child of the toolbar, so coordinates are toolbar-relative.
+        // y=1 accounts for the toolbar's 1px top border so icons sit inside the
+        // toolbar content area.
+        let tray_y = 1i16;
         log::debug!(
             "Tray: icons={} visible={} sni={} x={} y={} w={} h={} anchor={}",
             self.icons.len(),
@@ -478,7 +509,9 @@ impl FbTray {
             // Anchor the popup to the chevron slot: chevron slot screen-x =
             // tray_x + (visible+sni)*icon_size = right_anchor - icon_size.
             let popup_x = self.right_anchor - self.icon_size as i16;
-            let popup_y = tray_y - popup_h;
+            // Popup is a root child, so use screen-absolute y (toolbar's
+            // screen origin minus popup height).
+            let popup_y = self.toolbar_screen_y - popup_h;
 
             conn.conn().configure_window(
                 self.popup_window,

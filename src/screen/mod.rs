@@ -14,7 +14,7 @@ use crate::render::font::Font;
 #[cfg(feature = "wallpaper")]
 use crate::render::image::Image;
 use crate::slit::FbSlit;
-use crate::sni::{ActivateRequest, SniEvent};
+use crate::sni::{ActivateRequest, ContextMenuRequest, SniEvent};
 use futures_channel::mpsc::UnboundedSender;
 use crate::toolbar::{FbToolbar, ToolbarAction, ToolbarPlacement};
 use crate::tray::FbTray;
@@ -116,8 +116,13 @@ pub struct BScreen {
             tray: FbTray,
     /// Channel to request StatusNotifierItem activation (left-click).
     sni_activator: Option<UnboundedSender<ActivateRequest>>,
+    sni_context_menu: Option<UnboundedSender<ContextMenuRequest>>,
     taskbar_order: Vec<WindowId>,
     hidden: std::collections::HashSet<WindowId>,
+    /// Windows we deliberately passed through without management (popup menus,
+    /// tooltips, notifications, etc.). Tracked to avoid managing them on
+    /// re-MapRequest and to clean up on Unmap/Destroy.
+    passthrough: std::collections::HashSet<WindowId>,
     /// Window ids of decoration frames we created ourselves. Used to ignore
     /// the `MapRequest`/`CreateNotify` our own (non-override-redirect) frames
     /// generate, so we never try to re-manage them.
@@ -183,8 +188,9 @@ impl BScreen {
         trace_step("BScreen::new: toolbar ok");
         let slit = FbSlit::new(&conn, width, height, crate::slit::SlitPlacement::Right)?;
         trace_step("BScreen::new: slit ok");
-        let mut tray = FbTray::new(&conn, width, height)?;
+        let mut tray = FbTray::new(&conn, width, height, toolbar.window_id())?;
         tray.set_anchor(toolbar.tray_right_anchor());
+        tray.set_toolbar_screen_y(toolbar.placement_y());
         trace_step("BScreen::new: tray ok");
 
         let mut screen = Self {
@@ -196,6 +202,7 @@ impl BScreen {
             workspaces: Vec::new(),
             current_workspace: 0,
             hidden: std::collections::HashSet::new(),
+            passthrough: std::collections::HashSet::new(),
             frame_ids: std::collections::HashSet::new(),
             pending_closes: std::collections::HashMap::new(),
             window_manager: WindowManager::new(),
@@ -209,6 +216,7 @@ impl BScreen {
             slit,
             tray,
             sni_activator: None,
+            sni_context_menu: None,
             taskbar_order: Vec::new(),
             root_menu: None,
             menu_visible: false,
@@ -368,6 +376,28 @@ impl BScreen {
         screen.init_keys()?;
         trace_step("BScreen::new: init_keys ok");
 
+        // Log all top-level windows with geometry to help diagnose the
+        // persistent white-square issue at the top-right corner.
+        if log::log_enabled!(log::Level::Debug) {
+            let root = screen.conn.root_window();
+            if let Ok(tree) = screen.conn.conn().query_tree(root)?.reply() {
+                for &child in &tree.children {
+                    if let Ok(g) = screen.conn.conn().get_geometry(child)?.reply() {
+                        if let Ok(a) = screen.conn.conn().get_window_attributes(child)?.reply() {
+                            let name = screen.read_wm_name(child);
+                            let name = if name.is_empty() { "(unnamed)" } else { &name };
+                            log::debug!(
+                                "top-level window: {:#x} name={} x={} y={} w={} h={} map={:?} or={}",
+                                child, name,
+                                g.x, g.y, g.width, g.height,
+                                a.map_state, a.override_redirect,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         Ok(screen)
     }
 
@@ -445,8 +475,19 @@ impl BScreen {
 
     /// Adopt any pre-existing top-level windows so we manage them on startup.
     fn scan_windows(&mut self) -> Result<(), anyhow::Error> {
+        let own = [
+            self.toolbar.window_id(),
+            self.slit.window_id(),
+            self.tray.window_id(),
+            self.tray.popup_window_id(),
+        ];
         let children = self.conn.conn().query_tree(self.root_window)?.reply()?.children;
         for child in children {
+            // Skip our own helper windows (toolbar, slit, tray, popup).
+            if own.contains(&child) {
+                log::debug!("scan_windows: skipping own window {:#x}", child);
+                continue;
+            }
             let attrs = match self.conn.conn().get_window_attributes(child)?.reply() {
                 Ok(a) => a,
                 Err(_) => continue,
@@ -458,8 +499,12 @@ impl BScreen {
             // Dock apps (override-redirect applets or _NET_WM_WINDOW_TYPE_DOCK)
             // go to the slit instead of being framed.
             if attrs.override_redirect {
-                if self.is_dock_app(child)? {
+                let is_dock = self.is_dock_app(child)?;
+                if is_dock {
+                    log::debug!("scan_windows: adding dock app {:#x} to slit", child);
                     self.slit.add_window(&self.conn, child)?;
+                } else {
+                    log::debug!("scan_windows: skipping OR window {:#x} (not a dock app)", child);
                 }
                 continue;
             }
@@ -469,8 +514,41 @@ impl BScreen {
         Ok(())
     }
 
-    /// Detect a dock applet: either it requests `_NET_WM_WINDOW_TYPE_DOCK`, or
-    /// it is a small `override_redirect` window (classic wmaker/bbtools style).
+    /// Check whether `window` has a `_NET_WM_WINDOW_TYPE` that our WM should not
+    /// manage — popup menus, tooltips, combos, notifications, etc. These are
+    /// passed through (mapped but not reparented or decorated).
+    fn is_superficial(&self, window: u32) -> Result<bool, anyhow::Error> {
+        let prop = self.conn.atoms().get(Atom::NetWmWindowType);
+        if prop == x11rb::NONE {
+            return Ok(false);
+        }
+        let Ok(reply) = self
+            .conn
+            .conn()
+            .get_property(false, window, prop, 0u32, 0, 1024)?
+            .reply()
+        else {
+            return Ok(false);
+        };
+        let types: Vec<u32> = reply.value32().map(|it| it.collect()).unwrap_or_default();
+        let unwanted = [
+            self.conn.atoms().get(Atom::NetWmWindowTypeMenu),
+            self.conn.atoms().get(Atom::NetWmWindowTypeDropdownMenu),
+            self.conn.atoms().get(Atom::NetWmWindowTypePopupMenu),
+            self.conn.atoms().get(Atom::NetWmWindowTypeTooltip),
+            self.conn.atoms().get(Atom::NetWmWindowTypeNotification),
+            self.conn.atoms().get(Atom::NetWmWindowTypeCombo),
+            self.conn.atoms().get(Atom::NetWmWindowTypeDnd),
+        ];
+        Ok(types.iter().any(|t| unwanted.contains(t)))
+    }
+
+    /// Detect a dock applet: only windows that explicitly request
+    /// `_NET_WM_WINDOW_TYPE_DOCK`. We deliberately do NOT fall back to
+    /// "small override-redirect windows" — that heuristic wrongly catches
+    /// XEmbed system-tray icons (which are small `override_redirect` windows
+    /// but belong in the *tray*, not the slit) and turns them into a stray
+    /// white square in the slit.
     fn is_dock_app(&self, window: u32) -> Result<bool, anyhow::Error> {
         let prop = self.conn.atoms().get(Atom::NetWmWindowType);
         let dock = self.conn.atoms().get(Atom::NetWmWindowTypeDock);
@@ -484,16 +562,6 @@ impl BScreen {
                 let types: Vec<u32> = reply.value32().map(|it| it.collect()).unwrap_or_default();
                 if types.contains(&dock) {
                     return Ok(true);
-                }
-            }
-        }
-        // Fallback: small override-redirect windows are treated as dockapps.
-        if let Ok(attrs) = self.conn.conn().get_window_attributes(window)?.reply() {
-            if attrs.override_redirect {
-                if let Ok(g) = self.conn.conn().get_geometry(window)?.reply() {
-                    if g.width <= 128 && g.height <= 128 {
-                        return Ok(true);
-                    }
                 }
             }
         }
@@ -832,6 +900,7 @@ impl BScreen {
         self.toolbar.reconfigure(&self.conn, new_w, new_h)?;
         self.slit.reconfigure(&self.conn, new_w, new_h)?;
         let anchor = self.toolbar.tray_right_anchor();
+        self.tray.set_toolbar_screen_y(self.toolbar.placement_y());
         self.tray.reconfigure(&self.conn, new_w, new_h, anchor)?;
         let w = self.tray.current_width();
         self.toolbar.set_tray_reserve(w);
@@ -925,6 +994,11 @@ impl BScreen {
         self.sni_activator = Some(activator);
     }
 
+    /// Wire the SNI context-menu channel (right-click).
+    pub fn set_sni_context_menu(&mut self, cmenu: UnboundedSender<ContextMenuRequest>) {
+        self.sni_context_menu = Some(cmenu);
+    }
+
     /// Dispatch a `SniEvent` to the tray (registration / removal / icon update).
     pub fn sni_event(&mut self, ev: SniEvent) -> Result<(), anyhow::Error> {
         match ev {
@@ -956,6 +1030,8 @@ impl BScreen {
         if self.window_manager.get_window(window).is_some() {
             return Ok(());
         }
+
+        log::debug!("manage_window: {:#x}", window);
 
         // Ignore override-redirect clients (tooltips, menus, our own frames).
         if let Ok(attrs) = self.conn.conn().get_window_attributes(window)?.reply() {
@@ -1026,8 +1102,11 @@ impl BScreen {
         )?;
 
         // Passive grab: intercept ButtonPress on the client before the client
-        // consumes it, so we can change focus.
-        for btn in [xproto::ButtonIndex::M1, xproto::ButtonIndex::M2, xproto::ButtonIndex::M3] {
+        // consumes it, so we can change focus (click-to-focus on left click).
+        // We do NOT grab right/middle buttons — those would interfere with
+        // active grabs that context menus (SNI) install on themselves and the
+        // pointer would freeze before the active grab can process the event.
+        for btn in [xproto::ButtonIndex::M1] {
             let _ = self.conn.conn().grab_button(
                 false,                                  // owner_events
                 window,                                 // grab_window
@@ -1481,8 +1560,29 @@ impl BScreen {
                 if self.frame_ids.contains(&e.window) {
                     return Ok(());
                 }
+                // Never manage our own helper windows (toolbar, slit, tray, popup).
+                if e.window == self.toolbar.window_id()
+                    || e.window == self.slit.window_id()
+                    || e.window == self.tray.window_id()
+                    || e.window == self.tray.popup_window_id()
+                {
+                    return Ok(());
+                }
                 // Only adopt direct children of the root that we don't own.
                 if e.parent == self.root_window {
+                    // Popup menus, tooltips, notifications — map but don't manage.
+                    if self.is_superficial(e.window)? {
+                        log::debug!("MapRequest passthrough window {:#x}", e.window);
+                        self.passthrough.insert(e.window);
+                        self.conn.conn().map_window(e.window)?;
+                        self.conn.conn().change_window_attributes(
+                            e.window,
+                            &ChangeWindowAttributesAux::new()
+                                .event_mask(EventMask::STRUCTURE_NOTIFY),
+                        )?;
+                        self.conn.flush()?;
+                        return Ok(());
+                    }
                     if self.is_dock_app(e.window)? {
                         self.slit.add_window(&self.conn, e.window)?;
                         self.recalc_struts();
@@ -1495,6 +1595,13 @@ impl BScreen {
                 // Catch dockapps that appear after startup (they are usually
                 // override-redirect and so never generate a MapRequest).
                 if e.parent == self.root_window && e.override_redirect {
+                    if e.window == self.toolbar.window_id()
+                        || e.window == self.slit.window_id()
+                        || e.window == self.tray.window_id()
+                        || e.window == self.tray.popup_window_id()
+                    {
+                        return Ok(());
+                    }
                     if self.is_dock_app(e.window)? {
                         self.slit.add_window(&self.conn, e.window)?;
                         self.recalc_struts();
@@ -1515,6 +1622,10 @@ impl BScreen {
             }
             Event::UnmapNotify(e) => {
                 if self.hidden.contains(&e.window) {
+                    return Ok(());
+                }
+                // Passthrough window (popup menu etc.) gone.
+                if self.passthrough.remove(&e.window) {
                     return Ok(());
                 }
                 // Window was iconified — we intentionally unmapped it
@@ -1544,6 +1655,7 @@ impl BScreen {
             }
             Event::DestroyNotify(e) => {
                 self.hidden.remove(&e.window);
+                self.passthrough.remove(&e.window);
                 if self.tray.owns_window(e.window) {
                     if e.window != self.tray.window_id() {
                         self.tray.undock_window(&self.conn, e.window)?;
@@ -1638,12 +1750,22 @@ impl BScreen {
                     if self.tray.handle_button_press(e.event_x, e.event_y) {
                         self.tray.toggle_popup(&self.conn)?;
                     } else if let Some(service) = self.tray.sni_slot_at(e.event_x, e.event_y) {
-                        if let Some(tx) = &self.sni_activator {
-                            let _ = tx.unbounded_send(ActivateRequest {
-                                service,
-                                x: e.root_x as i32,
-                                y: e.root_y as i32,
-                            });
+                        if e.detail == 3 {
+                            if let Some(tx) = &self.sni_context_menu {
+                                let _ = tx.unbounded_send(ContextMenuRequest {
+                                    service,
+                                    x: e.root_x as i32,
+                                    y: e.root_y as i32,
+                                });
+                            }
+                        } else {
+                            if let Some(tx) = &self.sni_activator {
+                                let _ = tx.unbounded_send(ActivateRequest {
+                                    service,
+                                    x: e.root_x as i32,
+                                    y: e.root_y as i32,
+                                });
+                            }
                         }
                     }
                 } else if e.event == self.toolbar.window_id() {
@@ -1819,6 +1941,12 @@ impl BScreen {
                     let timestamp = e.data.as_data32()[0];
                     let opcode = e.data.as_data32()[1];
                     let client = e.data.as_data32()[2];
+                    // If the client was already managed by the WM (frame +
+                    // titlebar), unmanage it first so the empty frame doesn't
+                    // linger as a white square after reparent into the tray.
+                    if self.window_manager.get_window(client).is_some() {
+                        let _ = self.unmanage_window(client, true);
+                    }
                     let _ = self.tray.handle_opcode(
                         &self.conn, opcode, client, timestamp,
                     );

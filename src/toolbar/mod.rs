@@ -252,7 +252,7 @@ impl FbToolbar {
         self.window_items = items;
     }
 
-    fn placement_y(&self) -> i16 {
+    pub fn placement_y(&self) -> i16 {
         match self.style.placement {
             ToolbarPlacement::Top => 0,
             ToolbarPlacement::Bottom => {

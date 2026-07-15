@@ -55,11 +55,23 @@ impl Rustbox {
 
         rustbox.notify = Some(NotifyDaemon::new(&rustbox.conn, notify_rx, signal_tx));
         log::info!("Rustbox::new: notify ok");
+
+        // Sync notification daemon dimensions with the actual screen geometry.
+        if let Some(screen) = rustbox.screens.first() {
+            let rw = screen.width();
+            let rh = screen.height();
+            if let Some(n) = rustbox.notify.as_mut() {
+                n.set_screen_size(rw, rh);
+                log::debug!("NotifyDaemon: synced screen size {}x{}", rw, rh);
+            }
+        }
         match SniManager::new(notify_tx, signal_rx) {
             Ok(sni) => {
                 let activator = sni.activator();
+                let ctx_menu = sni.context_menu_activator();
                 for screen in rustbox.screens.iter_mut() {
                     screen.set_sni_activator(activator.clone());
+                    screen.set_sni_context_menu(ctx_menu.clone());
                 }
                 rustbox.sni = Some(sni);
                 log::info!("StatusNotifierWatcher (SNI) ativo");
@@ -519,8 +531,13 @@ impl Rustbox {
             screen.reconfigure()?;
         }
         if let Some(n) = self.notify.as_mut() {
-            let s = self.conn.screen();
-            n.set_screen_size(s.width_in_pixels, s.height_in_pixels);
+            // Use the BScreen's live root geometry (just refreshed by
+            // screen.reconfigure above) instead of conn.screen() which
+            // holds the *initial* connection-setup values and never updates
+            // on RandR events.
+            if let Some(first) = self.screens.first() {
+                n.set_screen_size(first.width(), first.height());
+            }
             n.reload_config(&self.conn);
         }
         Ok(())

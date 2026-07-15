@@ -20,7 +20,7 @@ pub struct SlitStyle {
 impl Default for SlitStyle {
     fn default() -> Self {
         Self {
-            placement: SlitPlacement::Right,
+            placement: SlitPlacement::Bottom,
             gap: 2,
         }
     }
@@ -191,6 +191,11 @@ impl FbSlit {
             conn.conn().unmap_window(self.window)?;
             return Ok(());
         }
+
+        log::debug!(
+            "Slit: thickness={} length={} dock={} window={:#x}",
+            self.thickness, self.length, self.dock.len(), self.window,
+        );
 
         let (x, y, w, h) = match self.style.placement {
             SlitPlacement::Right => (

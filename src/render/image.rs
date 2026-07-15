@@ -134,6 +134,25 @@ impl Image {
         let (w, h) = rgba.dimensions();
         Ok(Self { width: w, height: h, data: rgba.into_raw() })
     }
+
+    /// Composite the image's alpha channel against a solid background color,
+    /// producing fully opaque RGB data. This is needed for SNI tray icons on
+    /// X11 without a compositor: the server discards the alpha byte during
+    /// `PutImage` (depth 24) and transparent pixels would otherwise show as
+    /// black instead of blending into the toolbar background.
+    pub fn composite_on_bg(mut self, bg_r: u8, bg_g: u8, bg_b: u8) -> Self {
+        for pixel in self.data.chunks_mut(4) {
+            let r = pixel[0];
+            let g = pixel[1];
+            let b = pixel[2];
+            let a = pixel[3] as f32 / 255.0;
+            pixel[0] = (bg_r as f32 + (r as f32 - bg_r as f32) * a).round().clamp(0.0, 255.0) as u8;
+            pixel[1] = (bg_g as f32 + (g as f32 - bg_g as f32) * a).round().clamp(0.0, 255.0) as u8;
+            pixel[2] = (bg_b as f32 + (b as f32 - bg_b as f32) * a).round().clamp(0.0, 255.0) as u8;
+            pixel[3] = 255; // fully opaque
+        }
+        self
+    }
 }
 
 pub struct ImageControl {
