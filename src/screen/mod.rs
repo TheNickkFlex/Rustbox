@@ -138,8 +138,15 @@ pub struct BScreen {
     /// keycodes after a keyboard MappingNotify (layout switch).
     raw_bindings: Vec<(ModMask, String, KeyAction)>,
     dialog: Option<DialogState>,
+    /// The currently-installed wallpaper pixmap (root window background).
+    /// Kept so we can `FreePixmap` the previous one on every re-apply and
+    /// avoid leaking ~8 MB of X server memory per RandR resize/rotation.
+    wallpaper_pixmap: Option<u32>,
     /// Shared flag to signal the event loop to stop.
     running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Shared flag requesting a restart (re-exec) on shutdown, set by the
+    /// menu's "Restart" entry.
+    restart_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 enum DragState {
@@ -169,6 +176,7 @@ impl BScreen {
         conn: X11Connection,
         name: &str,
         running: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        restart_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, anyhow::Error> {
         let screen = conn.screen();
         let root = screen.root;
@@ -225,6 +233,8 @@ impl BScreen {
             raw_bindings: Vec::new(),
             dialog: None,
             running,
+            wallpaper_pixmap: None,
+            restart_flag,
         };
 
         // Give the root a visible cursor so the pointer is not invisible, and
@@ -313,6 +323,9 @@ impl BScreen {
                                     &ChangeWindowAttributesAux::new().background_pixmap(pix),
                                 );
                                 let _ = screen.conn.conn().clear_area(false, root, 0, 0, 0, 0);
+                                if let Some(old) = screen.wallpaper_pixmap.replace(pix) {
+                                    let _ = screen.conn.conn().free_pixmap(old);
+                                }
                                 trace_step("wallpaper: APLICADO COM SUCESSO");
                             }
                             Err(e) => {
@@ -978,6 +991,12 @@ impl BScreen {
                             &ChangeWindowAttributesAux::new().background_pixmap(pix),
                         );
                         let _ = self.conn.conn().clear_area(false, root, 0, 0, 0, 0);
+                        // Free the previous pixmap so each re-apply (every
+                        // RandR resize/rotation) does not leak ~8 MB on the
+                        // X server.
+                        if let Some(old) = self.wallpaper_pixmap.replace(pix) {
+                            let _ = self.conn.conn().free_pixmap(old);
+                        }
                     }
                 }
             }
@@ -1425,10 +1444,10 @@ impl BScreen {
             aux = aux.y(y as i32);
         }
         if mask & CF_WIDTH != 0 {
-            aux = aux.width(w as u32);
+            aux = aux.width(w.max(1) as u32);
         }
         if mask & CF_HEIGHT != 0 {
-            aux = aux.height(h as u32);
+            aux = aux.height(h.max(1) as u32);
         }
         if mask & CF_BORDER != 0 {
             aux = aux.border_width(bw as u32);
@@ -1441,10 +1460,15 @@ impl BScreen {
         // relative to the frame, so we apply it directly to the client.
         self.conn.conn().configure_window(window, &aux)?;
 
-        // When the client requests a new size, resize the frame to match.
+        // When the client requests a new size, resize the frame to match —
+        // unless it is currently fullscreen, in which case we keep the frame
+        // covering the whole root window (games/engines that send their own
+        // ConfigureRequest after a video-mode change must not shrink the frame).
         if (mask & (CF_WIDTH | CF_HEIGHT)) != 0 {
             if let Some(rw) = self.window_manager.get_window_mut(window) {
-                rw.frame_mut().resize(&self.conn, w, h)?;
+                if !rw.is_fullscreen() {
+                    rw.frame_mut().resize(&self.conn, w.max(1), h.max(1))?;
+                }
             }
         }
         Ok(())
@@ -2094,7 +2118,7 @@ impl BScreen {
             MenuItemType::Restart => {
                 self.close_menus()?;
                 log::info!("Restart via menu");
-                // TODO: signal Rustbox to restart
+                self.request_restart();
             }
             MenuItemType::Reconfig => {
                 self.close_menus()?;
@@ -2129,6 +2153,15 @@ impl BScreen {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Request a full restart: ask the event loop to stop and re-exec the
+    /// binary (handled in main.rs after event_loop() returns).
+    fn request_restart(&mut self) {
+        self.restart_flag
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.running
+            .store(false, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn create_dialog(

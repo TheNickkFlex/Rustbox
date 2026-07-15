@@ -111,6 +111,8 @@ impl FbWinFrame {
         width: u16,
         height: u16,
     ) -> Result<Self, anyhow::Error> {
+        let width = width.max(1);
+        let height = height.max(1);
         let title_height = 22;
         let border_width = 2u16;
         let bevel_width = 2;
@@ -308,8 +310,9 @@ impl FbWinFrame {
     }
 
     pub fn resize(&mut self, conn: &X11Connection, width: u16, height: u16) -> Result<(), anyhow::Error> {
+        let width = width.max(1);
+        let height = height.max(1);
         self.width = width;
-        self.height = height;
         let frame_height = if self.shaded {
             self.title_height + self.border_width * 2
         } else {
@@ -346,6 +349,8 @@ impl FbWinFrame {
         x: i16, y: i16,
         w: u16, h: u16,
     ) -> Result<(), anyhow::Error> {
+        let w = w.max(1);
+        let h = h.max(1);
         self.width = w;
         self.height = h;
         let fh = if self.shaded {

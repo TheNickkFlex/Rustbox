@@ -87,6 +87,10 @@ trait StatusNotifierItem {
     /// `Vec` of `(width, height, ARGB32 bytes)` frames; apps usually send one.
     #[zbus(property)]
     fn icon_pixmap(&self) -> zbus::Result<Vec<(i32, i32, Vec<u8>)>>;
+
+    /// Emitted by the app when its icon changes (badge, play/pause, etc.).
+    #[zbus(signal)]
+    fn new_icon(&self) -> zbus::Result<()>;
 }
 
 /// The `org.kde.StatusNotifierWatcher` service we expose on the session bus.
@@ -102,16 +106,22 @@ impl Watcher {
         #[zbus(signal_emitter)] emitter: SignalEmitter<'_>,
     ) -> fdo::Result<()> {
         let _ = emitter.status_notifier_item_registered(&service).await;
-        // The argument is normally the item's bus name; some clients send an
-        // absolute object path instead. For v1 we only handle the common case
-        // (bus name + the spec's default path) — good enough for Discord/
-        // Telegram/Electron.
-        let _ = self
-            .cmd_tx
-            .unbounded_send(Command::Register {
-                bus: service,
-                path: "/StatusNotifierItem".into(),
-            });
+        // The argument is normally the item's bus name. Some clients (older
+        // Qt/Chromium) send an absolute object path, or "bus_name/path"
+        // concatenated. Parse both forms so those apps also show up in the tray.
+        let (bus, path) = if let Some(slash) = service.find('/') {
+            let (b, p) = service.split_at(slash);
+            let b = if b.is_empty() {
+                // Absolute path only: build a synthetic bus name.
+                "org.kde.StatusNotifierItem"
+            } else {
+                b
+            };
+            (b.to_string(), p.to_string())
+        } else {
+            (service, "/StatusNotifierItem".into())
+        };
+        let _ = self.cmd_tx.unbounded_send(Command::Register { bus, path });
         Ok(())
     }
 
@@ -369,8 +379,8 @@ async fn handle_register(
     });
 
     let proxy = StatusNotifierItemProxy::builder(conn)
-        .destination(bus)?
-        .path(path)?
+        .destination(bus.to_string())?
+        .path(path.to_string())?
         .build()
         .await?;
 
@@ -384,6 +394,83 @@ async fn handle_register(
             });
             signal_pipe(wake_w);
         }
+    }
+
+    // Keep the tray icon alive: some apps (Discord, media players, etc.)
+    // change their icon after registration (notification badge, play/pause).
+    // Watch the dedicated SNI `NewIcon` signal plus the `IconPixmap` and
+    // `IconName` property changes, re-sending `SniEvent::Updated` each time.
+    let proxy_clone_for_new = proxy.clone();
+    let bus_for_new = bus.to_string();
+    let to_wm_for_new = to_wm_tx.clone();
+    smol::spawn(async move {
+        use futures_util::stream::StreamExt;
+        if let Ok(mut new_icon) = proxy_clone_for_new.receive_new_icon().await {
+            while let Some(_sig) = new_icon.next().await {
+                if let Ok(frames) = proxy_clone_for_new.icon_pixmap().await {
+                    if let Some((w, h, argb)) = largest_frame(&frames) {
+                        let _ = to_wm_for_new.send(SniEvent::Updated {
+                            service: bus_for_new.clone(),
+                            width: w as u32,
+                            height: h as u32,
+                            argb,
+                        });
+                        signal_pipe(wake_w);
+                    }
+                }
+            }
+        }
+    })
+    .detach();
+
+    // `IconPixmap` property changes.
+    {
+        let bus = bus.to_string();
+        let to_wm_tx = to_wm_tx.clone();
+        let proxy_clone = proxy.clone();
+        smol::spawn(async move {
+            use futures_util::stream::StreamExt;
+            let mut changes = proxy_clone.receive_icon_pixmap_changed().await;
+            while let Some(_change) = changes.next().await {
+                if let Ok(frames) = proxy_clone.icon_pixmap().await {
+                    if let Some((w, h, argb)) = largest_frame(&frames) {
+                        let _ = to_wm_tx.send(SniEvent::Updated {
+                            service: bus.clone(),
+                            width: w as u32,
+                            height: h as u32,
+                            argb,
+                        });
+                        signal_pipe(wake_w);
+                    }
+                }
+            }
+        })
+        .detach();
+    }
+
+    // `IconName` property changes (re-resolve the theme icon).
+    {
+        let bus = bus.to_string();
+        let to_wm_tx = to_wm_tx.clone();
+        let proxy_clone = proxy.clone();
+        smol::spawn(async move {
+            use futures_util::stream::StreamExt;
+            let mut changes = proxy_clone.receive_icon_name_changed().await;
+            while let Some(_change) = changes.next().await {
+                if let Ok(frames) = proxy_clone.icon_pixmap().await {
+                    if let Some((w, h, argb)) = largest_frame(&frames) {
+                        let _ = to_wm_tx.send(SniEvent::Updated {
+                            service: bus.clone(),
+                            width: w as u32,
+                            height: h as u32,
+                            argb,
+                        });
+                        signal_pipe(wake_w);
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     Ok(())

@@ -7,12 +7,11 @@ authors = ["Rustbox Team <rustbox@lists.sourceforge.net>"]
 license = "MIT"
 
 [features]
-default = ["xrender", "xinerama", "xrandr", "xshape", "composite", "wallpaper"]
+default = ["xrender", "xinerama", "xrandr", "xshape", "wallpaper"]
 xrender = ["x11rb/render"]
 xinerama = ["x11rb/xinerama"]
 xrandr = ["x11rb/randr"]
 xshape = ["x11rb/shape"]
-composite = ["x11rb/composite", "x11rb/damage"]
 freetype2 = []
 fribidi = ["unicode-bidi"]
 debug = []
@@ -60,16 +59,11 @@ regex = "1"
 # Glob pattern matching
 glob-match = "0.2"
 
-# Signal handling
-signal-hook = "0.3"
-
 # Timezone support (localtime_r)
 libc = "0.2"
 
-# D-Bus (notification daemon / StatusNotifierHost)
-dbus = "0.9"
-
-# D-Bus (pure-Rust, async) for StatusNotifierItem (modern tray apps)
+# D-Bus (pure-Rust, async) for both the notification daemon and the
+# StatusNotifierItem (modern tray apps) — served on a single zbus connection.
 zbus = { version = "5", default-features = false, features = ["async-io"] }
 
 # Lightweight async executor used by the SNI D-Bus thread (zbus async-io backend)

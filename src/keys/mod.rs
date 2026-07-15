@@ -127,6 +127,12 @@ pub fn parse_action(action_str: &str) -> Option<KeyAction> {
     }
 }
 
+/// Bits of "lock" modifiers that vary independently of a shortcut itself
+/// (CapsLock = 0x02, NumLock/Mod2 = 0x10).  These must be masked out when
+/// comparing a key event's state, and grabbed for every combination so the
+/// shortcut fires regardless of CapsLock/NumLock state.
+pub const LOCK_MASK: u16 = 0x0002 | 0x0010;
+
 /// Combine two ModMask values into one (bitwise OR).
 pub fn combine_modmask(a: ModMask, b: ModMask) -> ModMask {
     ModMask::from(u16::from(a) | u16::from(b))
@@ -220,11 +226,26 @@ pub fn apply_bindings<C: Connection>(
             keycode,
             action: action.clone(),
         });
-        // Also grab with numlock mask so the binding works regardless of
-        // numlock state.  This is what every mainstream WM does.
-        let numlock = ModMask::M2; // typical numlock
-        let both = combine_modmask(*modmask, numlock);
-        let _ = conn.grab_key(false, root, both, keycode, GrabMode::ASYNC, GrabMode::ASYNC);
+
+        // XGrabKey requires an exact modifier bit match — there is no
+        // partial wildcard.  A binding must therefore be grabbed for every
+        // combination of "lock" modifiers (CapsLock, NumLock) that might be
+        // active independently of the shortcut itself.  This is what i3, dwm
+        // and openbox all do.  Without these extra grabs a shortcut only
+        // fires when NumLock happens to be in the exact state of the single
+        // grab registered below.
+        let base = u16::from(*modmask);
+        for extra in [0u16, 0x0002, 0x0010, 0x0012] {
+            let combined = ModMask::from(base | extra);
+            let _ = conn.grab_key(
+                false,
+                root,
+                combined,
+                keycode,
+                GrabMode::ASYNC,
+                GrabMode::ASYNC,
+            );
+        }
     }
     Ok(resolved)
 }
@@ -260,9 +281,11 @@ pub fn match_key<'a>(
     state: u16,
     detail: u8,
 ) -> Option<&'a KeyAction> {
-    let state_masked = state & 0x0f; // ignore numlock, scrollock etc.
+    // Ignore only the lock modifiers (CapsLock/NumLock) — keep Mod3/Mod4/Mod5
+    // so Super/Win (Mod4) and other custom modifiers are matched correctly.
+    let state_masked = state & !LOCK_MASK;
     for b in bindings {
-        if b.keycode == detail && u16::from(b.modmask) & 0x0f == state_masked {
+        if b.keycode == detail && u16::from(b.modmask) & !LOCK_MASK == state_masked {
             return Some(&b.action);
         }
     }

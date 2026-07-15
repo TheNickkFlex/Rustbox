@@ -39,6 +39,15 @@ fn main() -> Result<(), anyhow::Error> {
 
     log::info!("Rustbox-rs 1.4.0 starting...");
 
+    // Reap child processes automatically.  Every launched app (menu exec,
+    // fbrun, keybind Exec) leaves a Child handle that is dropped without
+    // wait(); ignoring SIGCHLD makes the kernel collect the zombies for us
+    // instead of them piling up until the WM exits.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::signal(libc::SIGCHLD, libc::SIG_IGN);
+    }
+
     let args: Vec<String> = std::env::args().collect();
     let (display_name, config_dir, socket_path) = parse_cli_args(&args);
 
@@ -102,6 +111,16 @@ fn main() -> Result<(), anyhow::Error> {
     }
 
     log::info!("Rustbox shutting down");
+    if rustbox.should_restart() {
+        use std::os::unix::process::CommandExt;
+        let exe = std::env::current_exe()?;
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        log::info!("Restarting: {:?} {:?}", exe, args);
+        // Replace the current process image in place (no fork) so the PID and
+        // X11 selection ownership transition cleanly.
+        let err = std::process::Command::new(exe).args(args).exec();
+        log::error!("exec() failed on restart: {err}");
+    }
     Ok(())
 }
 

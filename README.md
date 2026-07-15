@@ -28,7 +28,7 @@ running.
 - **Built-in notifications.** `org.freedesktop.Notifications` + dunstctl,
   rules, markup, icons, progress bars, stack tags — all inside the WM.
 
-## Resource usage - No Wallpaper mode
+## Resource usage — No Wallpaper mode
 
 Average footprint of the release build measured **idle** (no managed windows)
 on a virtual X server (Xephyr, 1024×768). VRAM is the X server-side footprint
@@ -55,6 +55,33 @@ Measured idle on Xephyr at **1920×1080**:
 | RAM             | ~62.8 MB (RSS) | ~35 MB above the no-wallpaper figure. This is glibc heap fragmentation left over from the one-time PNG decode+scale; it is **resolution-independent** (the displayed pixels live in the X server, not in the WM). `malloc_trim` at startup releases the freed decode buffers, keeping `VmSize` at ~282 MB. |
 | CPU             | ~0.6 %         | Idle; the wallpaper is painted once (and again only on resize).                                                            |
 | VRAM (X server) | ~8.4 MB        | Root background pixmap at 1920×1080×4 ≈ 8.3 MB. Scales with resolution: ~3.1 MB at 1024×768, ~33 MB at 4K.                |
+
+#### VRAM math (wallpaper background pixmap)
+
+The wallpaper is a single 32-bit (4-byte) pixmap painted as the root
+background, so its server-side cost is exactly `width × height × 4 bytes`:
+
+```
+VRAM = width × height × 4 bytes
+
+  1024 × 768  × 4 =  3,145,728 B   ≈ 3.0 MB
+  1280 × 720  × 4 =  3,686,400 B   ≈ 3.5 MB
+  1366 × 768  × 4 =  4,194,048 B   ≈ 4.0 MB
+  1920 × 1080 × 4 =  8,294,400 B   ≈ 8.4 MB
+  2560 × 1440 × 4 = 14,745,600 B   ≈ 14.1 MB
+  3840 × 2160 × 4 = 33,177,600 B   ≈ 33.6 MB   (4K)
+```
+
+This pixmap is freed and re-created on each screen resize/rotation, so the
+per-resolution figure above is the *steady-state* footprint — the WM does not
+accumulate wallpaper pixmaps over time.
+
+#### Side-by-side summary
+
+| Build                        | RAM (RSS, idle) | VRAM (idle, 1920×1080) | CPU (idle) |
+|------------------------------|-----------------|------------------------|------------|
+| `--no-default-features …` (no wallpaper) | ~27.6 MB | ~0.15 MB (+ per-window frames) | ~0.6 % |
+| default (with wallpaper)     | ~62.8 MB        | ~8.4 MB                 | ~0.6 % |
 
 To reclaim the ~35 MB of RSS on constrained hardware, build **without** the
 `wallpaper` feature (see Compile-time features) — you get the gray-background
@@ -153,7 +180,7 @@ cargo install --path .
 #### Compile-time features
 
 Rustbox is built with Cargo features. The default set is
-`xrender xinerama xrandr xshape composite wallpaper`.
+`xrender xinerama xrandr xshape wallpaper`.
 
 The bundled **wallpaper** is compiled behind the `wallpaper` feature. On
 extremely limited hardware you can build without it to skip the embedded image
@@ -167,7 +194,7 @@ cargo build --release
 
 # Wallpaper disabled — leanest runtime, gray background instead
 cargo build --release --no-default-features \
-  --features "xrender xinerama xrandr xshape composite"
+  --features "xrender xinerama xrandr xshape"
 ```
 
 > Note: the `image` crate stays linked regardless, because it is also used for
@@ -210,9 +237,9 @@ them manually.
 - **Fonts**: `fontdb` (discovery), `ab_glyph` (rasterization),
   `ttf-parser` / `skrifa` (emoji, COLRv1)
 - **Images**: [`image`](https://crates.io/crates/image) crate (PNG, XPM, etc.)
-- **D-Bus**: `dbus` (notifications), `zbus` + `smol` (SNI tray)
-- **Other**: `regex`, `serde`, `anyhow`, `env_logger`, `glob-match`,
-  `signal-hook`, `libc`
+- **D-Bus**: `zbus` + `smol` (single async connection serving both the
+  notification daemon and the SNI tray)
+- **Other**: `regex`, `serde`, `anyhow`, `env_logger`, `glob-match`, `libc`
 
 ## License
 

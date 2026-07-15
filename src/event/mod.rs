@@ -19,7 +19,7 @@ pub struct Rustbox {
     command_registry: CommandRegistry,
     display_name: String,
     config_dir: String,
-    restart: bool,
+    restart: Arc<AtomicBool>,
     exit_code: i32,
     remote_buffer: String,
     notify: Option<NotifyDaemon>,
@@ -28,14 +28,16 @@ pub struct Rustbox {
 
 impl Rustbox {
     pub fn new(conn: X11Connection, display_name: &str, config_dir: &str) -> Result<Self, anyhow::Error> {
+        let running = Arc::new(AtomicBool::new(true));
+        let restart = Arc::new(AtomicBool::new(false));
         let mut rustbox = Self {
             conn,
             screens: Vec::new(),
-            running: Arc::new(AtomicBool::new(true)),
+            running: running.clone(),
             command_registry: CommandRegistry::new(),
             display_name: display_name.to_string(),
             config_dir: config_dir.to_string(),
-            restart: false,
+            restart,
             exit_code: 0,
             remote_buffer: String::new(),
             notify: None,
@@ -85,7 +87,13 @@ impl Rustbox {
         use x11rb::protocol::xproto::{ChangeWindowAttributesAux, EventMask};
 
         crate::screen::trace_step("init_screens: BScreen::new ...");
-        let bscreen = BScreen::new(0, self.conn.clone(), "default", self.running.clone())?;
+        let bscreen = BScreen::new(
+            0,
+            self.conn.clone(),
+            "default",
+            self.running.clone(),
+            self.restart.clone(),
+        )?;
         crate::screen::trace_step("init_screens: BScreen::new done");
 
         self.conn.conn().change_window_attributes(
@@ -250,11 +258,11 @@ impl Rustbox {
     }
 
     pub fn should_restart(&self) -> bool {
-        self.restart
+        self.restart.load(Ordering::Relaxed)
     }
 
     pub fn set_restart(&mut self, restart: bool) {
-        self.restart = restart;
+        self.restart.store(restart, Ordering::Relaxed);
     }
 
     pub fn exit_code(&self) -> i32 {
