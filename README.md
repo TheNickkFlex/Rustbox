@@ -43,7 +43,7 @@ The root background is the default gray; no PNG is decoded or scaled.
 
 | Resource     | Average (idle) | Notes                                                                       |
 |--------------|----------------|-----------------------------------------------------------------------------|
-| RAM (WM RSS) | ~8.0 MB        | Dominated by the font DB + emoji font loaded at startup. Stable over time.  |
+| RAM (WM RSS) | ~13.5 MB        | Dominated by the font DB + emoji font loaded at startup. Stable over time.  |
 | CPU          | ~0.0 %         | Event loop blocks (poll) while idle; essentially idle.                      |
 
 ### Wallpaper mode (default)
@@ -54,7 +54,7 @@ one-time decode/scale cost at startup and again on every screen resize.
 
 | Resource          | Average (idle) | Notes                                                                                                       |
 |-------------------|----------------|-------------------------------------------------------------------------------------------------------------|
-| RAM (WM RSS)      | ~8.0 MB        | The wallpaper is server-side (in the X server), so the WM RSS is the same as the no-wallpaper case.         |
+| RAM (WM RSS)      | ~13.5 MB        | The wallpaper is server-side (in the X server), so the WM RSS is the same as the no-wallpaper case.         |
 | CPU               | ~0.0 %         | Idle; the wallpaper is painted once (and again only on resize).                                             |
 | VRAM (root pixmap)| ~8.4 MB        | Root background pixmap at 1920×1080×4 ≈ 8.3 MB. Scales with resolution: ~3.1 MB at 1024×768, ~33 MB at 4K.  |
 
