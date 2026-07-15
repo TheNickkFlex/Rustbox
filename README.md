@@ -30,24 +30,21 @@ running.
 
 ## Resource usage
 
-Measured **idle** (no managed windows) on a nested X server (Xephyr
-1920×1080) with the release build. Two binaries were compared: the default
-build (**with** the `wallpaper` feature) and the `--no-default-features`
-build (**without** it). RAM is the WM process RSS; VRAM is the X server's RSS
-(all server-side resources — windows, pixmaps, GCs — live in the X server, not
-in the WM).
+Measured **idle** (no managed windows, freshly started) on a nested X server
+(Xephyr 1920×1080) with the release build. These are the **WM process**
+numbers only — the Xephyr server has its own separate footprint and must not
+be added to the WM's, or the result is doubled. Read the WM RSS from
+`/proc/<rustbox-pid>/status` (`VmRSS`), not from the Xephyr process.
 
 ### No Wallpaper mode
 
 Compiled with `--no-default-features --features "xrender xinerama xrandr xshape"`.
 The root background is the default gray; no PNG is decoded or scaled.
 
-| Resource        | Average (idle) | Notes                                                                                  |
-|-----------------|----------------|----------------------------------------------------------------------------------------|
-| RAM (WM RSS)    | ~61.6 MB       | Dominated by the font DB + emoji font loaded at startup. Stable over time.             |
-| RAM (Xephyr RSS)| ~60.7 MB       | Server-side footprint: root + toolbar + tray windows and GCs (no wallpaper pixmap).    |
-| CPU             | ~0.6 %         | Event loop blocks while idle; essentially idle.                                        |
-| WM VmSize       | ~358 MB        | Virtual address space (includes mapped shared libraries).                              |
+| Resource     | Average (idle) | Notes                                                                       |
+|--------------|----------------|-----------------------------------------------------------------------------|
+| RAM (WM RSS) | ~8.0 MB        | Dominated by the font DB + emoji font loaded at startup. Stable over time.  |
+| CPU          | ~0.0 %         | Event loop blocks (poll) while idle; essentially idle.                      |
 
 ### Wallpaper mode (default)
 
@@ -55,26 +52,22 @@ Compiled with `--release` (default features, `wallpaper` enabled). The
 wallpaper is an X11 server-side pixmap set as the root background; it adds a
 one-time decode/scale cost at startup and again on every screen resize.
 
-| Resource        | Average (idle) | Notes                                                                                                                      |
-|-----------------|----------------|----------------------------------------------------------------------------------------------------------------------------|
-| RAM (WM RSS)    | ~79.7 MB       | ~18 MB above the no-wallpaper figure (glibc heap left over from the one-time PNG decode+scale; **resolution-independent** — the displayed pixels live in the X server, not in the WM). |
-| RAM (Xephyr RSS)| ~68.8 MB       | The extra ~8 MB over the no-wallpaper case is the root background pixmap (see below).                                     |
-| CPU             | ~0.6 %         | Idle; the wallpaper is painted once (and again only on resize).                                                            |
-| VRAM (root pixmap) | ~8.4 MB   | Root background pixmap at 1920×1080×4 ≈ 8.3 MB. Scales with resolution: ~3.1 MB at 1024×768, ~33 MB at 4K.                 |
+| Resource          | Average (idle) | Notes                                                                                                       |
+|-------------------|----------------|-------------------------------------------------------------------------------------------------------------|
+| RAM (WM RSS)      | ~8.0 MB        | The wallpaper is server-side (in the X server), so the WM RSS is the same as the no-wallpaper case.         |
+| CPU               | ~0.0 %         | Idle; the wallpaper is painted once (and again only on resize).                                             |
+| VRAM (root pixmap)| ~8.4 MB        | Root background pixmap at 1920×1080×4 ≈ 8.3 MB. Scales with resolution: ~3.1 MB at 1024×768, ~33 MB at 4K.  |
 
 The wallpaper background pixmap is a single 32-bit (4-byte) pixmap painted as
 the root background, so its steady-state server-side cost is exactly
 `width × height × 4 bytes`. The WM frees and re-creates it on each screen
-resize/rotation, so it does **not** accumulate over time.
-
-To reclaim the ~18 MB of WM RSS on constrained hardware, build **without** the
-`wallpaper` feature (see Compile-time features) — you get the gray-background
-WM at ~61.6 MB instead, with identical functionality otherwise.
+resize/rotation, so it does **not** accumulate over time. Note this VRAM lives
+in the **X server**, not in the WM process.
 
 > **Reproduce the numbers:** `./scripts/test-xephyr.sh` (wallpaper build) or
 > `./scripts/test-xephyr.sh nowp` (no-wallpaper build) launches a nested Xephyr
-> on `:5`; read `VmRSS` from `/proc/<rustbox-pid>/status` and from the Xephyr
-> PID for the respective figures above.
+> on `:5`; read `VmRSS` from `/proc/<rustbox-pid>/status` for the WM figure
+> above (do **not** add the Xephyr process RSS).
 
 ## Features
 
