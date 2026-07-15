@@ -124,10 +124,12 @@ impl FbToolbar {
         // indicator on laptops. On desktops `read_battery` returns `None` and we
         // simply skip it. Uses the kernel sysfs interface, so it also works on
         // Android/Termux (Bionic) where glibc-oriented crates fail.
-        let (battery_state, battery_width) = match read_battery() {
+        let init_battery = read_battery();
+        let (battery_state, battery_width) = match init_battery {
             Some(s) => (Some(s), 74),
             None => (None, 0),
         };
+        log::info!("Toolbar battery init: width={}, state={:?}", battery_width, battery_state);
 
         let toolbar_h = (style.height + style.border_width * 2) as u16;
 
@@ -151,7 +153,7 @@ impl FbToolbar {
             tray_reserve: 0,
             battery_width,
             battery_rect: Rectangle::zero(),
-            battery_state: None,
+            battery_state,
             last_battery_check: std::time::Instant::now(),
         };
         tb.layout();
@@ -226,18 +228,23 @@ impl FbToolbar {
     }
 
     /// Poll the battery (throttled to ~15 s) and cache `(percent, state)`.
-    /// Cheap no-op when no battery was detected at startup or when called more
-    /// often than the interval. Safe to call every clock tick.
+    /// When no battery was detected at init (`battery_width == 0`) we still
+    /// retry periodically — a laptop battery might appear later, or a
+    /// platform-specific reader (e.g. termux-battery-status) may only be
+    /// reachable from inside the event loop.
     pub fn refresh_battery(&mut self) {
-        if self.battery_width == 0 {
-            return;
-        }
         let now = std::time::Instant::now();
         if now.duration_since(self.last_battery_check).as_secs() < 15 {
             return;
         }
         self.last_battery_check = now;
-        self.battery_state = read_battery();
+        if let Some(s) = read_battery() {
+            if self.battery_width == 0 {
+                log::info!("Battery detected on refresh, enabling indicator");
+                self.battery_width = 74;
+            }
+            self.battery_state = Some(s);
+        }
     }
 
     /// Replace the running-window list. Each entry is `(name, focused)`.
