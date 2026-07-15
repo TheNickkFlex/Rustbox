@@ -1550,6 +1550,11 @@ impl BScreen {
                         self.recalc_struts();
                     }
                 } else if self.window_manager.get_window(e.window).is_some() {
+                    // Clear stale dialog reference before unmanaging so that
+                    // subsequent events don't operate on a destroyed window.
+                    if self.dialog.as_ref().map(|d| d.window) == Some(e.window) {
+                        self.dialog = None;
+                    }
                     self.unmanage_window(e.window, false)?;
                 }
             }
@@ -1725,7 +1730,14 @@ impl BScreen {
                             if let Some(btn) = w.frame().hit_test_button(e.event_x, e.event_y) {
                                 match btn {
                                     crate::window::frame::ButtonType::Close => {
-                                        let _ = self.close_window(win_id);
+                                        // Closing the dialog via kill_client would
+                                        // kill the WM's own X11 connection. Use the
+                                        // dedicated dialog path instead.
+                                        if self.dialog.as_ref().map(|d| d.window) == Some(win_id) {
+                                            let _ = self.close_dialog();
+                                        } else {
+                                            let _ = self.close_window(win_id);
+                                        }
                                         return Ok(());
                                     }
                                     crate::window::frame::ButtonType::Maximize => {
