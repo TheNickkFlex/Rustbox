@@ -42,6 +42,7 @@ impl WindowType {
 }
 
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct WinClient {
     window: WindowId,
     frame: Option<WindowId>,

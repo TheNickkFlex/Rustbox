@@ -61,7 +61,7 @@ fn read_percent(dir: &std::path::Path) -> Option<u8> {
     let now = read_i64(dir, "charge_now").or_else(|| read_i64(dir, "energy_now"));
     let full = read_i64(dir, "charge_full").or_else(|| read_i64(dir, "energy_full"));
     match (now, full) {
-        (Some(n), Some(f)) if f > 0 => Some(((n * 100 / f).clamp(0, 100) as u8)),
+        (Some(n), Some(f)) if f > 0 => Some((n * 100 / f).clamp(0, 100) as u8),
         _ => None,
     }
 }

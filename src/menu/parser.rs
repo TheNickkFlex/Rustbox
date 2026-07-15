@@ -319,7 +319,7 @@ mod tests {
 
     #[test]
     fn test_parse_basic_menu() {
-        let menu = r#"[begin] (Rustbox Root Menu)
+        let _menu = r#"[begin] (Rustbox Root Menu)
   [exec] (termion) {termion}
   [exec] (Firefox) {firefox}
   [separator]
@@ -330,7 +330,7 @@ mod tests {
   [restart] (Restart)
   [exit] (Exit)
 [end]"#;
-        let (label, items) = parse_menu_file("test.menu").unwrap_or_default();
+        let (_label, _items) = parse_menu_file("test.menu").unwrap_or_default();
         // Without a real file, we rely on preprocess + parse_block.
     }
 }

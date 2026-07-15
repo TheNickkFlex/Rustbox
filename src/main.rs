@@ -236,5 +236,4 @@ fn print_info() {
     #[cfg(feature = "xrender")] println!("  XRender: enabled");
     #[cfg(feature = "xinerama")] println!("  Xinerama: enabled");
     #[cfg(feature = "xrandr")] println!("  XRandR: enabled");
-    #[cfg(feature = "composite")] println!("  Composite: enabled");
-}
+    }

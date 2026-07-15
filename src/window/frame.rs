@@ -4,7 +4,7 @@ use x11rb::protocol::xproto::Segment;
 
 use crate::core::Rectangle;
 use crate::render::font::Font;
-use crate::render::texture::{Texture, TextureRender};
+use crate::render::texture::TextureRender;
 use crate::x11::X11Connection;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -49,15 +49,12 @@ pub struct FbWinFrame {
     border_width: u16,
     bevel_width: u16,
     title_visible: bool,
-    handles_visible: bool,
-    tab_width: u16,
     label: String,
     pub iconified: bool,
     pub maximized: bool,
     pub shaded: bool,
     pub focused: bool,
     pub no_maximize: bool,
-    texture: Texture,
     gc: Option<xproto::Gcontext>,
     font: Font,
     buttons: Vec<FrameButton>,
@@ -210,15 +207,12 @@ impl FbWinFrame {
             border_width,
             bevel_width,
             title_visible: true,
-            handles_visible: true,
-            tab_width: 64,
             label: String::new(),
             iconified: false,
             maximized: false,
             shaded: false,
             focused: false,
             no_maximize: false,
-            texture: Texture::new(),
             gc: Some(gc),
             font,
             buttons: Vec::new(),

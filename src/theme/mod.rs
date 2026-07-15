@@ -6,7 +6,6 @@ use crate::render::texture::Texture;
 
 pub struct Theme {
     name: String,
-    parent: Option<Box<Theme>>,
     resources: HashMap<String, String>,
 }
 
@@ -14,7 +13,6 @@ impl Theme {
     pub fn new<S: Into<String>>(name: S) -> Self {
         Self {
             name: name.into(),
-            parent: None,
             resources: HashMap::new(),
         }
     }

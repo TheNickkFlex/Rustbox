@@ -10,7 +10,6 @@ use x11rb::protocol::xproto::{
     self, ConnectionExt as _, CreateWindowAux, EventMask, InputFocus, WindowClass,
 };
 use x11rb::protocol::Event;
-use x11rb::rust_connection::RustConnection;
 use x11rb::CURRENT_TIME;
 
 use rustbox_rs::render::font::Font;

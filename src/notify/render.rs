@@ -35,7 +35,6 @@ pub struct Popup {
     h: u16,
     font: Font,
     icon_pix: Option<u32>,
-    theme: Theme,
     action_rects: Vec<(Rectangle, String)>,
     action_labels: Vec<String>,
     // Cached pixels to avoid synchronous alloc_color round-trips on redraws.
@@ -145,7 +144,6 @@ impl Popup {
             h,
             font,
             icon_pix,
-            theme,
             action_rects: Vec::new(),
             action_labels: Vec::new(),
             bg_pixel,
@@ -192,7 +190,7 @@ impl Popup {
     }
 
     /// Width and height for the given content and fixed width.
-    fn measure(notif: &RawNotification, font: &Font, conn: &X11Connection, width: u16) -> (u16, u16) {
+    fn measure(notif: &RawNotification, font: &Font, _conn: &X11Connection, width: u16) -> (u16, u16) {
         let fh = font.height() as i16;
         let body_w = width
             .saturating_sub((PAD * 2 + ICON as i16 + PAD) as u16)
@@ -409,7 +407,6 @@ impl Popup {
             let lw = self.font.text_width(rc, &pct)?;
             let lx = (bx + bw - lw as i16).max(bx);
             self.font.draw_text_on_bg(rc, self.window, self.gc, lx, by - 2, &pct, fg, bg)?;
-            ly += fh + 2;
         }
 
         // Action buttons.

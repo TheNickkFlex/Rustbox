@@ -17,8 +17,6 @@ pub struct Rustbox {
     screens: Vec<BScreen>,
     running: Arc<AtomicBool>,
     command_registry: CommandRegistry,
-    display_name: String,
-    config_dir: String,
     restart: Arc<AtomicBool>,
     exit_code: i32,
     remote_buffer: String,
@@ -27,7 +25,7 @@ pub struct Rustbox {
 }
 
 impl Rustbox {
-    pub fn new(conn: X11Connection, display_name: &str, config_dir: &str) -> Result<Self, anyhow::Error> {
+    pub fn new(conn: X11Connection, _display_name: &str, _config_dir: &str) -> Result<Self, anyhow::Error> {
         let running = Arc::new(AtomicBool::new(true));
         let restart = Arc::new(AtomicBool::new(false));
         let mut rustbox = Self {
@@ -35,8 +33,6 @@ impl Rustbox {
             screens: Vec::new(),
             running: running.clone(),
             command_registry: CommandRegistry::new(),
-            display_name: display_name.to_string(),
-            config_dir: config_dir.to_string(),
             restart,
             exit_code: 0,
             remote_buffer: String::new(),

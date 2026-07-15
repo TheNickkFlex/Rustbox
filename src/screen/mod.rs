@@ -5,7 +5,6 @@ use x11rb::protocol::xproto::{
 };
 use x11rb::NONE;
 
-use crate::config::FocusConfig;
 use crate::core::{Rectangle, Strut};
 use crate::keys::{self, KeyAction, KeyBinding};
 use crate::menu::menu::Menu;
@@ -65,7 +64,6 @@ pub type ScreenNum = usize;
 /// `WM_DELETE_WINDOW` and are waiting for it to actually unmap/destroy before
 /// forcibly killing it.
 struct PendingClose {
-    window: WindowId,
     sent_at: std::time::Instant,
     timeout: std::time::Duration,
 }
@@ -80,7 +78,6 @@ struct DialogState {
     window: u32,
     frame: u32,
     gc: u32,
-    title: String,
     text: String,
     action: DialogAction,
     min_kc: u8,
@@ -109,8 +106,6 @@ pub struct BScreen {
     monitors: Vec<Rectangle>,
     /// The monitor we treat as "primary" (contains 0,0, else the largest).
     primary_rect: Rectangle,
-    name: String,
-    focus_config: FocusConfig,
     toolbar: FbToolbar,
             slit: FbSlit,
             tray: FbTray,
@@ -174,7 +169,7 @@ impl BScreen {
     pub fn new(
         screen_num: ScreenNum,
         conn: X11Connection,
-        name: &str,
+        _name: &str,
         running: std::sync::Arc<std::sync::atomic::AtomicBool>,
         restart_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, anyhow::Error> {
@@ -218,8 +213,6 @@ impl BScreen {
             workarea: Rectangle::new(0, 0, width, height),
             monitors: vec![Rectangle::new(0, 0, width, height)],
             primary_rect: Rectangle::new(0, 0, width, height),
-            name: name.to_string(),
-            focus_config: FocusConfig::default(),
             toolbar,
             slit,
             tray,
@@ -1352,7 +1345,6 @@ impl BScreen {
             self.pending_closes.insert(
                 window,
                 PendingClose {
-                    window,
                     sent_at: std::time::Instant::now(),
                     timeout: std::time::Duration::from_secs(5),
                 },
@@ -2287,7 +2279,6 @@ impl BScreen {
             window,
             frame,
             gc,
-            title,
             text: initial_text,
             action,
             min_kc,

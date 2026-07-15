@@ -254,7 +254,6 @@ pub fn render_emoji(cp: u32, px: u32) -> Option<(u32, u32, Vec<u8>)> {
     }
 
     let fd = emoji_font_data()?;
-    let fr = FontRef::try_from_slice(&fd.data).ok()?;
     let ch = char::from_u32(cp)?;
     fallback_emoji_outline(&fd.data, ch, px)
 }
@@ -659,24 +658,6 @@ fn scale_rgba(w: u32, h: u32, rgba: Vec<u8>, target_h: u32) -> (u32, u32, Vec<u8
     };
     let scaled = image::imageops::resize(&img, tw, target_h, image::imageops::FilterType::Lanczos3);
     (tw, target_h, scaled.into_raw())
-}
-
-/// Clamp a rectangle to non-negative coordinates so GetImage never receives
-/// a negative origin. Returns the adjusted `(x, y, width, height)`.
-fn clamp_rect(x: i16, y: i16, w: u16, h: u16) -> (i16, i16, u16, u16) {
-    let img_x = x.max(0);
-    let img_y = y.max(0);
-    let img_w = if x < 0 {
-        (w as i16 + x).max(0) as u16
-    } else {
-        w
-    };
-    let img_h = if y < 0 {
-        (h as i16 + y).max(0) as u16
-    } else {
-        h
-    };
-    (img_x, img_y, img_w, img_h)
 }
 
 /// Decode an X pixel value into RGB assuming a BGRX (little-endian TrueColor)

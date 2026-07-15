@@ -9,7 +9,7 @@ pub mod render;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::OnceLock;
 use std::time::Instant;
 
@@ -90,10 +90,10 @@ impl NotificationsHandler {
         actions: Vec<String>,
         hints: std::collections::HashMap<String, zbus::zvariant::Value<'_>>,
         expire: i32,
-        #[zbus(signal_emitter)] emitter: zbus::object_server::SignalEmitter<'_>,
+        #[zbus(signal_emitter)] _emitter: zbus::object_server::SignalEmitter<'_>,
     ) -> u32 {
         let parsed = parse_hints_zbus(&hints);
-        let replace_key = parsed.sync_key.as_ref().or(parsed.stack_tag.as_ref());
+        let _replace_key = parsed.sync_key.as_ref().or(parsed.stack_tag.as_ref());
         let id = if replaces_id != 0 {
             replaces_id
         } else {

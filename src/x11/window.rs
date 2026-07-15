@@ -13,8 +13,6 @@ pub struct FbWindow {
     width: u16,
     height: u16,
     border_width: u16,
-    depth: u8,
-    class: xproto::WindowClass,
     override_redirect: bool,
 }
 
@@ -42,8 +40,6 @@ impl FbWindow {
             width,
             height,
             border_width,
-            depth,
-            class,
             override_redirect: false,
         })
     }

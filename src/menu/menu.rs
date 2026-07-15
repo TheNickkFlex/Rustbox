@@ -44,8 +44,6 @@ pub struct Menu {
 
     // ---- interaction state ----
     active_index: Option<usize>,
-    /// Which item has an open submenu (index into `items`).
-    which_sub: Option<usize>,
     /// The child submenu window, if open.
     submenu: Option<Box<Menu>>,
 
@@ -130,7 +128,6 @@ impl Menu {
             columns: 1,
             rows_per_col: 1,
             active_index: None,
-            which_sub: None,
             submenu: None,
             screen_x: 0,
             screen_y: 0,
