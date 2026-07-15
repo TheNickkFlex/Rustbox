@@ -137,8 +137,8 @@ impl FbToolbar {
             window,
             gc,
             font,
-            fg_pixel: conn.screen().black_pixel,
-            bg_pixel: conn.screen().white_pixel,
+            fg_pixel: conn.screen().white_pixel,
+            bg_pixel: conn.screen().black_pixel,
             screen_width,
             screen_height,
             style,
@@ -374,8 +374,8 @@ impl FbToolbar {
                 rect,
                 self.style.bevel_width,
                 !current,
-                white,
                 black,
+                white,
             )?;
 
             let text = format!("{}", i + 1);
@@ -408,8 +408,8 @@ impl FbToolbar {
                     &rect,
                     self.style.bevel_width,
                     !*focused,
-                    white,
                     black,
+                    white,
                 )?;
 
                 let avail = (rect.width as i16 - 6).max(4);

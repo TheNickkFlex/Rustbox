@@ -28,64 +28,53 @@ running.
 - **Built-in notifications.** `org.freedesktop.Notifications` + dunstctl,
   rules, markup, icons, progress bars, stack tags — all inside the WM.
 
-## Resource usage — No Wallpaper mode
+## Resource usage
 
-Average footprint of the release build measured **idle** (no managed windows)
-on a virtual X server (Xephyr, 1024×768). VRAM is the X server-side footprint
-(windows, pixmaps, GCs) — read from the X server process, since all server
-resources live there.
+Measured **idle** (no managed windows) on a nested X server (Xephyr
+1920×1080) with the release build. Two binaries were compared: the default
+build (**with** the `wallpaper` feature) and the `--no-default-features`
+build (**without** it). RAM is the WM process RSS; VRAM is the X server's RSS
+(all server-side resources — windows, pixmaps, GCs — live in the X server, not
+in the WM).
 
-| Resource | Average (idle) | Notes                                                                             |
-|----------|----------------|-----------------------------------------------------------------------------------|
-| RAM      | ~27.6 MB (RSS)   | Stable; no leak over 10 s. Dominated by the font DB + emoji font loaded at startup. |
-| CPU      | ~0.6 %         | Event loop blocks while idle; essentially idle.                                   |
-| VRAM     | ~0.15 MB       | Root + toolbar + tray windows and GCs. Grows only with notifications (≈4 KB icon pixmap each) and managed window frames. |
+### No Wallpaper mode
 
-### Resource usage — Wallpaper mode
+Compiled with `--no-default-features --features "xrender xinerama xrandr xshape"`.
+The root background is the default gray; no PNG is decoded or scaled.
 
-Same build/runtime as above but compiled **with** the `wallpaper` feature
-(default). The wallpaper is an X11 server-side pixmap set as the root
-background; it adds a one-time decode/scale cost at startup and again on every
-screen resize.
+| Resource        | Average (idle) | Notes                                                                                  |
+|-----------------|----------------|----------------------------------------------------------------------------------------|
+| RAM (WM RSS)    | ~61.6 MB       | Dominated by the font DB + emoji font loaded at startup. Stable over time.             |
+| RAM (Xephyr RSS)| ~60.7 MB       | Server-side footprint: root + toolbar + tray windows and GCs (no wallpaper pixmap).    |
+| CPU             | ~0.6 %         | Event loop blocks while idle; essentially idle.                                        |
+| WM VmSize       | ~358 MB        | Virtual address space (includes mapped shared libraries).                              |
 
-Measured idle on Xephyr at **1920×1080**:
+### Wallpaper mode (default)
+
+Compiled with `--release` (default features, `wallpaper` enabled). The
+wallpaper is an X11 server-side pixmap set as the root background; it adds a
+one-time decode/scale cost at startup and again on every screen resize.
 
 | Resource        | Average (idle) | Notes                                                                                                                      |
 |-----------------|----------------|----------------------------------------------------------------------------------------------------------------------------|
-| RAM             | ~62.8 MB (RSS) | ~35 MB above the no-wallpaper figure. This is glibc heap fragmentation left over from the one-time PNG decode+scale; it is **resolution-independent** (the displayed pixels live in the X server, not in the WM). `malloc_trim` at startup releases the freed decode buffers, keeping `VmSize` at ~282 MB. |
+| RAM (WM RSS)    | ~79.7 MB       | ~18 MB above the no-wallpaper figure (glibc heap left over from the one-time PNG decode+scale; **resolution-independent** — the displayed pixels live in the X server, not in the WM). |
+| RAM (Xephyr RSS)| ~68.8 MB       | The extra ~8 MB over the no-wallpaper case is the root background pixmap (see below).                                     |
 | CPU             | ~0.6 %         | Idle; the wallpaper is painted once (and again only on resize).                                                            |
-| VRAM (X server) | ~8.4 MB        | Root background pixmap at 1920×1080×4 ≈ 8.3 MB. Scales with resolution: ~3.1 MB at 1024×768, ~33 MB at 4K.                |
+| VRAM (root pixmap) | ~8.4 MB   | Root background pixmap at 1920×1080×4 ≈ 8.3 MB. Scales with resolution: ~3.1 MB at 1024×768, ~33 MB at 4K.                 |
 
-#### VRAM math (wallpaper background pixmap)
+The wallpaper background pixmap is a single 32-bit (4-byte) pixmap painted as
+the root background, so its steady-state server-side cost is exactly
+`width × height × 4 bytes`. The WM frees and re-creates it on each screen
+resize/rotation, so it does **not** accumulate over time.
 
-The wallpaper is a single 32-bit (4-byte) pixmap painted as the root
-background, so its server-side cost is exactly `width × height × 4 bytes`:
-
-```
-VRAM = width × height × 4 bytes
-
-  1024 × 768  × 4 =  3,145,728 B   ≈ 3.0 MB
-  1280 × 720  × 4 =  3,686,400 B   ≈ 3.5 MB
-  1366 × 768  × 4 =  4,194,048 B   ≈ 4.0 MB
-  1920 × 1080 × 4 =  8,294,400 B   ≈ 8.4 MB
-  2560 × 1440 × 4 = 14,745,600 B   ≈ 14.1 MB
-  3840 × 2160 × 4 = 33,177,600 B   ≈ 33.6 MB   (4K)
-```
-
-This pixmap is freed and re-created on each screen resize/rotation, so the
-per-resolution figure above is the *steady-state* footprint — the WM does not
-accumulate wallpaper pixmaps over time.
-
-#### Side-by-side summary
-
-| Build                        | RAM (RSS, idle) | VRAM (idle, 1920×1080) | CPU (idle) |
-|------------------------------|-----------------|------------------------|------------|
-| `--no-default-features …` (no wallpaper) | ~27.6 MB | ~0.15 MB (+ per-window frames) | ~0.6 % |
-| default (with wallpaper)     | ~62.8 MB        | ~8.4 MB                 | ~0.6 % |
-
-To reclaim the ~35 MB of RSS on constrained hardware, build **without** the
+To reclaim the ~18 MB of WM RSS on constrained hardware, build **without** the
 `wallpaper` feature (see Compile-time features) — you get the gray-background
-WM at ~27.6 MB instead, with identical functionality otherwise.
+WM at ~61.6 MB instead, with identical functionality otherwise.
+
+> **Reproduce the numbers:** `./scripts/test-xephyr.sh` (wallpaper build) or
+> `./scripts/test-xephyr.sh nowp` (no-wallpaper build) launches a nested Xephyr
+> on `:5`; read `VmRSS` from `/proc/<rustbox-pid>/status` and from the Xephyr
+> PID for the respective figures above.
 
 ## Features
 
@@ -219,6 +208,32 @@ The `-socket` flag also works for direct X socket paths.
 
 The root menu launches **kitty** as the default terminal emulator. Make sure
 it is installed.
+
+### Testing inside a nested Xephyr
+
+To try Rustbox without touching your real session, use the helper script.
+It starts a nested Xephyr (on `:5` by default, using your current `$DISPLAY`
+as the host) and launches Rustbox against it — no manual `DISPLAY` juggling
+required:
+
+```bash
+# Wallpaper build (default)
+./scripts/test-xephyr.sh
+
+# No-wallpaper build
+./scripts/test-xephyr.sh nowp
+
+# Stop the test session
+./scripts/test-xephyr.sh kill
+
+# Inside the nested display, open a terminal:
+DISPLAY=:5 kitty &
+```
+
+> Note: Xephyr must be able to find a host X server, so run the script from a
+> normal X session (where `$DISPLAY` points at a real server such as `:0`).
+> If you see `Xephyr cannot open host display`, your `$DISPLAY` is not set or
+> points nowhere.
 
 ## Configuration
 
