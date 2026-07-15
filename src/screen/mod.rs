@@ -1232,6 +1232,11 @@ impl BScreen {
     /// graceful path. This avoids destroying `WM_DELETE_WINDOW`-aware apps
     /// (editors, IDEs, ...) before they can save their state.
     fn close_window(&mut self, window: u32) -> Result<(), anyhow::Error> {
+        // Never call kill_client on our own dialog window — that would kill
+        // the WM's X11 connection.  Route to close_dialog instead.
+        if self.dialog.as_ref().map_or(false, |d| d.window == window) {
+            return self.close_dialog();
+        }
         if self.window_manager.get_window(window).is_none() {
             return Ok(());
         }
@@ -1734,8 +1739,10 @@ impl BScreen {
                                         // kill the WM's own X11 connection. Use the
                                         // dedicated dialog path instead.
                                         if self.dialog.as_ref().map(|d| d.window) == Some(win_id) {
+                                            log::info!("Closing dialog via close_dialog (win={})", win_id);
                                             let _ = self.close_dialog();
                                         } else {
+                                            log::info!("Closing window via close_window (win={}) not dialog ({:?})", win_id, self.dialog.as_ref().map(|d| d.window));
                                             let _ = self.close_window(win_id);
                                         }
                                         return Ok(());
