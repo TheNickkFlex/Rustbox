@@ -150,8 +150,8 @@ Rustbox is built with Cargo features. The default set is
 
 The bundled **wallpaper** is compiled behind the `wallpaper` feature. On
 extremely limited hardware you can build without it to skip the embedded image
-and the decode/scale step at runtime. Keep the other features enabled — they
-are required for the WM to compile and run:
+and the decode/scale step at runtime, lowering the WM's resident memory. Keep
+the other features enabled — they are required for the WM to compile and run:
 
 ```bash
 # Wallpaper enabled (default)
@@ -164,7 +164,8 @@ cargo build --release --no-default-features \
 
 > Note: the `image` crate stays linked regardless, because it is also used for
 > tray icons, notifications and font rendering. Disabling `wallpaper` therefore
-> only skips the embedded wallpaper decode, not the whole crate.
+> reduces *runtime* memory (it skips the embedded wallpaper decode/scale), not
+> the binary size.
 
 ## Running
 
