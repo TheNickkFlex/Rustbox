@@ -1,8 +1,12 @@
-//! Minimal battery reader via the kernel sysfs `power_supply` interface
-//! (`/sys/class/power_supply`). This is dependency-free, so it builds and runs
-//! on a normal glibc Linux as well as on Android/Termux (Bionic), where crates
-//! that assume a glibc userspace fail to compile. Returns `None` when no
-//! battery is present (e.g. a desktop), so callers can skip the indicator.
+//! Battery reader with universal fallbacks:
+//!
+//! 1. Linux kernel sysfs  `/sys/class/power_supply` (standard Linux).
+//! 2. Termux API command `termux-battery-status` (Android/Termux).
+//!
+//! Returns `None` when no battery is present (desktop, no Termux:API), so
+//! callers can skip the indicator.  No external Rust dependencies required.
+
+use std::process::Command;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BatteryState {
@@ -14,14 +18,17 @@ pub enum BatteryState {
 
 pub type BatteryReading = (u8, BatteryState);
 
-/// Return `(percent, state)` for the first battery found, or `None` when no
-/// battery is present.
+/// Try every known battery reader in order and return the first success.
 pub fn read_battery() -> Option<BatteryReading> {
+    read_sysfs().or_else(read_termux)
+}
+
+// ---------------------------------------------------------------------------
+// 1. Linux kernel sysfs  (/sys/class/power_supply)
+// ---------------------------------------------------------------------------
+fn read_sysfs() -> Option<BatteryReading> {
     let base = std::path::Path::new("/sys/class/power_supply");
-    let read_dir = match std::fs::read_dir(base) {
-        Ok(d) => d,
-        Err(_) => return None,
-    };
+    let read_dir = std::fs::read_dir(base).ok()?;
     for entry in read_dir.flatten() {
         let dir = entry.path();
         if !dir.is_dir() {
@@ -46,13 +53,11 @@ pub fn read_battery() -> Option<BatteryReading> {
 }
 
 fn read_percent(dir: &std::path::Path) -> Option<u8> {
-    // Prefer the ready-made 0..100 `capacity` file.
     if let Ok(s) = std::fs::read_to_string(dir.join("capacity")) {
         if let Ok(v) = s.trim().parse::<i32>() {
             return Some(v.clamp(0, 100) as u8);
         }
     }
-    // Otherwise compute from charge_now / charge_full (or energy_*).
     let now = read_i64(dir, "charge_now").or_else(|| read_i64(dir, "energy_now"));
     let full = read_i64(dir, "charge_full").or_else(|| read_i64(dir, "energy_full"));
     match (now, full) {
@@ -76,12 +81,56 @@ fn read_state(dir: &std::path::Path, pct: u8) -> BatteryState {
         "Discharging" => BatteryState::Discharging,
         "Full" => BatteryState::Full,
         "Not charging" => {
-            if pct >= 100 {
-                BatteryState::Full
-            } else {
-                BatteryState::Discharging
-            }
+            if pct >= 100 { BatteryState::Full } else { BatteryState::Discharging }
         }
+        _ => BatteryState::Unknown,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 2. Termux API  (termux-battery-status)
+// ---------------------------------------------------------------------------
+/// Spawn `termux-battery-status` and parse its JSON output.
+fn read_termux() -> Option<BatteryReading> {
+    let out = Command::new("termux-battery-status")
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    // Expected JSON:  {"percentage": 87, "status": "Discharging", ...}
+    let raw = std::str::from_utf8(&out.stdout).ok()?;
+    parse_termux_json(raw)
+}
+
+fn parse_termux_json(raw: &str) -> Option<BatteryReading> {
+    let pct = raw
+        .find("\"percentage\"")
+        .and_then(|i| raw[i..].find(':'))
+        .and_then(|i| {
+            let rest = raw[i + 1..].trim_start();
+            let end = rest.find(|c: char| !c.is_ascii_digit())?;
+            rest[..end].parse::<u8>().ok()
+        })?;
+    let state = raw
+        .find("\"status\"")
+        .and_then(|i| raw[i..].find(':'))
+        .and_then(|i| {
+            let rest = raw[i + 1..].trim_start();
+            let s = rest.trim_matches('"');
+            let end = s.find('"')?;
+            Some(&s[..end])
+        })
+        .map(termux_status_to_state)
+        .unwrap_or(BatteryState::Unknown);
+    Some((pct.clamp(0, 100), state))
+}
+
+fn termux_status_to_state(s: &str) -> BatteryState {
+    match s {
+        "CHARGING" | "PLUGGED_AC" | "PLUGGED_USB" | "PLUGGED_WIRELESS" => BatteryState::Charging,
+        "DISCHARGING" | "UNPLUGGED" => BatteryState::Discharging,
+        "FULL" => BatteryState::Full,
         _ => BatteryState::Unknown,
     }
 }

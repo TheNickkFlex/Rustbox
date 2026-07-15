@@ -2610,10 +2610,6 @@ impl BScreen {
                 log::info!("Exit via keybinding");
                 self.running.store(false, std::sync::atomic::Ordering::Relaxed);
             }
-            KeyAction::Restart => {
-                log::info!("Restart via keybinding");
-                // TODO: signal Rustbox to restart
-            }
             KeyAction::Move => {
                 if let Some(active) = self.window_manager.active_window() {
                     let _ = self.conn.conn().grab_pointer(

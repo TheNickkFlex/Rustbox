@@ -14,7 +14,6 @@ pub enum KeyAction {
     GoToNextWorkspace,
     GoToPrevWorkspace,
     ShowMenu,
-    Restart,
     Exit,
     Exec(String),
 }
@@ -119,7 +118,6 @@ pub fn parse_action(action_str: &str) -> Option<KeyAction> {
         "NEXTWORKSPACE" | "GOTONEXTWORKSPACE" => Some(KeyAction::GoToNextWorkspace),
         "PREVWORKSPACE" | "GOTOPREVWORKSPACE" => Some(KeyAction::GoToPrevWorkspace),
         "SHOWMENU" | "ROOTMENU" => Some(KeyAction::ShowMenu),
-        "RESTART" => Some(KeyAction::Restart),
         "EXIT" | "QUIT" => Some(KeyAction::Exit),
         "EXEC" | "EXECUTE" => {
             let cmd = action_str.splitn(2, ' ').nth(1).unwrap_or("").trim().to_string();
