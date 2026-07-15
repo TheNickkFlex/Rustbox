@@ -72,6 +72,43 @@ fn db() -> &'static fontdb::Database {
     TEXT_DB.get_or_init(|| {
         let mut d = fontdb::Database::new();
         d.load_system_fonts();
+        log::info!("Font database: {} faces after load_system_fonts()", d.len());
+
+        // load_system_fonts() is a no-op on Android/Termux.  Try the most
+        // common font directories manually; directories that do not exist are
+        // silently skipped, so this is safe on every platform.
+        let extra = [
+            "/usr/share/fonts",
+            "/usr/local/share/fonts",
+            "/system/fonts",
+            "/system/font",
+        ];
+        for dir in &extra {
+            if std::path::Path::new(dir).is_dir() {
+                d.load_fonts_dir(dir);
+            }
+        }
+
+        // Termux and other prefix-based environments.
+        if let Ok(prefix) = std::env::var("PREFIX") {
+            let dir = format!("{}/share/fonts", prefix);
+            if std::path::Path::new(&dir).is_dir() {
+                d.load_fonts_dir(&dir);
+            }
+        }
+
+        // User-local font directories (not always covered on all platforms).
+        if let Ok(home) = std::env::var("HOME") {
+            for sub in &[".fonts", ".local/share/fonts"] {
+                let dir = format!("{}/{}", home, sub);
+                if std::path::Path::new(&dir).is_dir() {
+                    d.load_fonts_dir(&dir);
+                }
+            }
+        }
+
+        log::info!("Font database: {} faces after loading extra dirs", d.len());
+
         d
     })
 }
@@ -122,7 +159,8 @@ pub fn emoji_font_data() -> Option<&'static FontData> {
 
 /// Try to load an emoji font from common hardcoded paths.
 fn load_emoji_from_paths() -> Option<FontData> {
-    for path in &[
+    // Static paths first.
+    let static_paths = [
         "/usr/share/fonts/noto/NotoColorEmoji.ttf",
         "/usr/share/fonts/noto/NotoColorEmoji-Regular.ttf",
         "/usr/share/fonts/emojione/EmojiOneColor.otf",
@@ -131,14 +169,26 @@ fn load_emoji_from_paths() -> Option<FontData> {
         "/usr/share/fonts/google-noto-color-emoji-fonts/Noto-COLRv1.ttf",
         "/usr/share/fonts/opentype/noto/NotoColorEmoji.ttf",
         "/usr/share/noto/NotoColorEmoji.ttf",
-    ] {
+    ];
+    for path in &static_paths {
         if let Ok(data) = std::fs::read(path) {
-            return Some(FontData {
-                data,
-                face_index: 0,
-            });
+            return Some(FontData { data, face_index: 0 });
         }
     }
+
+    // Prefix-based paths (Termux, etc.).
+    if let Ok(prefix) = std::env::var("PREFIX") {
+        for rel in &[
+            "/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+            "/share/fonts/noto/NotoColorEmoji.ttf",
+        ] {
+            let path = format!("{}{}", prefix, rel);
+            if let Ok(data) = std::fs::read(&path) {
+                return Some(FontData { data, face_index: 0 });
+            }
+        }
+    }
+
     None
 }
 
