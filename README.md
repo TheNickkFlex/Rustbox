@@ -30,28 +30,32 @@ running.
 
 ## Resource usage
 
-Measured **idle** (no managed windows, freshly started) with the default
-release build (`cargo build --release`, wallpaper enabled) on a nested X
-server (Xephyr 1920×1080). These are the **WM process** numbers only — the
-Xephyr server has its own separate footprint and must not be added to the WM's,
-or the result is doubled. Read the WM RSS from `/proc/<rustbox-pid>/status`
-(`VmRSS`), not from the Xephyr process.
+These are the **WM process** numbers only — the X server (Xorg, Xephyr,
+termux-x11, …) has its own separate footprint and must **not** be added to the
+WM's, or the result is doubled. Read the WM RSS from `/proc/<rustbox-pid>/status`
+(`VmRSS`), not from the X server process.
 
-| Resource          | Average (idle) | Notes                                                                                                       |
-|-------------------|----------------|-------------------------------------------------------------------------------------------------------------|
-| RAM (WM RSS)      | ~13.5 MB        | Dominated by the font DB + emoji font loaded at startup. Stable over time.                                  |
-| CPU               | ~0.0 %         | Event loop blocks (poll) while idle; essentially idle.                                                      |
-| VRAM (root pixmap)| ~8.4 MB        | Root background pixmap at 1920×1080×4 ≈ 8.3 MB. Scales with resolution: ~3.1 MB at 1024×768, ~33 MB at 4K.  |
+Measured on the production target (Termux on Android, `termux-x11` display `:0`,
+default release build with wallpaper) and on a desktop nested Xephyr. The WM RSS
+is dominated by the font DB + emoji font loaded at startup and is stable over
+time (verified after 25+ min idle).
+
+| Resource       | Production (Termux/termux-x11) | Desktop (Xephyr 1920×1080) | Notes                                                              |
+|----------------|-------------------------------|----------------------------|--------------------------------------------------------------------|
+| RAM (WM RSS)   | ~5.3 MB                       | ~8–14 MB                   | Lower on Termux (fewer system fonts scanned). Idle, no open apps. |
+| CPU            | ~0.0 %                        | ~0.0 %                     | Event loop blocks (poll) while idle; essentially idle.             |
+| VRAM (root pixmap) | ~8.4 MB (at 1920×1080)   | ~8.4 MB                    | Root background pixmap; scales with resolution (see below).        |
 
 The wallpaper background pixmap is a single 32-bit (4-byte) pixmap painted as
 the root background, so its steady-state server-side cost is exactly
 `width × height × 4 bytes`. The WM frees and re-creates it on each screen
-resize/rotation, so it does **not** accumulate over time. Note this VRAM lives
-in the **X server**, not in the WM process.
+resize/rotation, so it does **not** accumulate over time. Note this lives in the
+**X server**, not in the WM process — the X server's own RSS (e.g. ~34 MB for
+termux-x11) is separate and grows with the windows *you* open, not with the WM.
 
-> **Reproduce the numbers:** `./scripts/test-xephyr.sh` launches a nested Xephyr
-> on `:5`; read `VmRSS` from `/proc/<rustbox-pid>/status` for the WM figure
-> above (do **not** add the Xephyr process RSS).
+> **Reproduce:** on the device, `grep VmRSS /proc/$(pgrep rustbox)/status`.
+> Compare against the X server PID (e.g. `pgrep termux-x11`) — do **not** add
+> the two.
 
 ## Features
 
