@@ -30,32 +30,17 @@ running.
 
 ## Resource usage
 
-Measured **idle** (no managed windows, freshly started) on a nested X server
-(Xephyr 1920×1080) with the release build. These are the **WM process**
-numbers only — the Xephyr server has its own separate footprint and must not
-be added to the WM's, or the result is doubled. Read the WM RSS from
-`/proc/<rustbox-pid>/status` (`VmRSS`), not from the Xephyr process.
-
-### No Wallpaper mode
-
-Compiled with `--no-default-features --features "xrender xinerama xrandr xshape"`.
-The root background is the default gray; no PNG is decoded or scaled.
-
-| Resource     | Average (idle) | Notes                                                                       |
-|--------------|----------------|-----------------------------------------------------------------------------|
-| RAM (WM RSS) | ~13.5 MB        | Dominated by the font DB + emoji font loaded at startup. Stable over time.  |
-| CPU          | ~0.0 %         | Event loop blocks (poll) while idle; essentially idle.                      |
-
-### Wallpaper mode (default)
-
-Compiled with `--release` (default features, `wallpaper` enabled). The
-wallpaper is an X11 server-side pixmap set as the root background; it adds a
-one-time decode/scale cost at startup and again on every screen resize.
+Measured **idle** (no managed windows, freshly started) with the default
+release build (`cargo build --release`, wallpaper enabled) on a nested X
+server (Xephyr 1920×1080). These are the **WM process** numbers only — the
+Xephyr server has its own separate footprint and must not be added to the WM's,
+or the result is doubled. Read the WM RSS from `/proc/<rustbox-pid>/status`
+(`VmRSS`), not from the Xephyr process.
 
 | Resource          | Average (idle) | Notes                                                                                                       |
 |-------------------|----------------|-------------------------------------------------------------------------------------------------------------|
-| RAM (WM RSS)      | ~13.5 MB        | The wallpaper is server-side (in the X server), so the WM RSS is the same as the no-wallpaper case.         |
-| CPU               | ~0.0 %         | Idle; the wallpaper is painted once (and again only on resize).                                             |
+| RAM (WM RSS)      | ~13.5 MB        | Dominated by the font DB + emoji font loaded at startup. Stable over time.                                  |
+| CPU               | ~0.0 %         | Event loop blocks (poll) while idle; essentially idle.                                                      |
 | VRAM (root pixmap)| ~8.4 MB        | Root background pixmap at 1920×1080×4 ≈ 8.3 MB. Scales with resolution: ~3.1 MB at 1024×768, ~33 MB at 4K.  |
 
 The wallpaper background pixmap is a single 32-bit (4-byte) pixmap painted as
@@ -64,8 +49,7 @@ the root background, so its steady-state server-side cost is exactly
 resize/rotation, so it does **not** accumulate over time. Note this VRAM lives
 in the **X server**, not in the WM process.
 
-> **Reproduce the numbers:** `./scripts/test-xephyr.sh` (wallpaper build) or
-> `./scripts/test-xephyr.sh nowp` (no-wallpaper build) launches a nested Xephyr
+> **Reproduce the numbers:** `./scripts/test-xephyr.sh` launches a nested Xephyr
 > on `:5`; read `VmRSS` from `/proc/<rustbox-pid>/status` for the WM figure
 > above (do **not** add the Xephyr process RSS).
 
