@@ -113,13 +113,16 @@ fn db() -> &'static fontdb::Database {
     })
 }
 
-fn resolve(family: fontdb::Family<'_>) -> Option<FontData> {
+fn resolve(family: &fontdb::Family<'_>) -> Option<FontData> {
     let d = db();
     let q = fontdb::Query {
-        families: &[family],
+        families: &[family.clone()],
         ..fontdb::Query::default()
     };
     let id = d.query(&q)?;
+    let face = d.face(id)?;
+    let fn0 = face.families.first().map(|(n,_)| n.as_str()).unwrap_or("?");
+    log::info!("fontdb matched family={:?} -> face families[0]={:?}", family, fn0);
     d.with_face_data(id, |data, face_index| FontData {
         data: data.to_vec(),
         face_index,
@@ -129,9 +132,15 @@ fn resolve(family: fontdb::Family<'_>) -> Option<FontData> {
 fn text_font_data() -> Option<&'static FontData> {
     TEXT_FONT
         .get_or_init(|| {
-            resolve(fontdb::Family::SansSerif)
-                .or_else(|| resolve(fontdb::Family::Name("DejaVu Sans")))
-                .or_else(|| resolve(fontdb::Family::Name("Liberation Sans")))
+            let r = resolve(&fontdb::Family::SansSerif)
+                .or_else(|| resolve(&fontdb::Family::Name("DejaVu Sans")))
+                .or_else(|| resolve(&fontdb::Family::Name("Liberation Sans")));
+            if r.is_some() {
+                log::info!("text_font_data: resolution OK");
+            } else {
+                log::warn!("text_font_data: ALL resolution attempts FAILED — using bitmap fallback");
+            }
+            r
         })
         .as_ref()
 }
@@ -146,10 +155,10 @@ pub fn emoji_font_data() -> Option<&'static FontData> {
     EMOJI_FONT
         .get_or_init(|| {
             // Try fontdb first (scans system font paths).
-            resolve(fontdb::Family::Name("Noto Color Emoji"))
-                .or_else(|| resolve(fontdb::Family::Name("Noto Emoji")))
-                .or_else(|| resolve(fontdb::Family::Name("EmojiOne Color")))
-                .or_else(|| resolve(fontdb::Family::Name("OpenMoji")))
+            resolve(&fontdb::Family::Name("Noto Color Emoji"))
+                .or_else(|| resolve(&fontdb::Family::Name("Noto Emoji")))
+                .or_else(|| resolve(&fontdb::Family::Name("EmojiOne Color")))
+                .or_else(|| resolve(&fontdb::Family::Name("OpenMoji")))
                 // Fallback: common hardcoded paths for distributions that
                 // install Noto Color Emoji outside fontdb's search scope.
                 .or_else(|| load_emoji_from_paths())

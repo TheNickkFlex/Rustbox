@@ -86,7 +86,7 @@ fn main() -> Result<(), anyhow::Error> {
 
     log::info!("Entering main event loop");
     if let Err(e) = rustbox.event_loop() {
-        log::error!("Event loop terminou com erro: {:?}", e);
+        log::error!("Event loop exited with error: {:?}", e);
         if let Ok(home) = std::env::var("HOME") {
             if let Ok(mut f) = std::fs::OpenOptions::new()
                 .create(true)

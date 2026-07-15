@@ -704,7 +704,7 @@ impl BScreen {
             })
             .unwrap_or_else(|| Rectangle::new(0, 0, self.root_width, self.root_height));
         log::info!(
-            "Monitores detectados: {} (primario {}x{} em {},{})",
+            "Detected {} monitor(s), primary {}x{} at ({},{})",
             self.monitors.len(),
             self.primary_rect.width,
             self.primary_rect.height,
