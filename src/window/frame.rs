@@ -184,15 +184,32 @@ impl FbWinFrame {
 
         // Best-effort: create a resize cursor for the handle_window.
         let resize_cursor = (|| -> Option<u32> {
-            let font = conn.conn().generate_id().ok()?;
-            conn.conn().open_font(font, b"cursor").ok()?;
-            let cursor = conn.conn().generate_id().ok()?;
-            conn.conn().create_glyph_cursor(
-                cursor, font, font,
-                96, 96, // XC_bottom_right_corner
-                0, 0, 0, 0xffff, 0xffff, 0xffff,
+            let conn = conn.conn();
+            // Try core cursor font
+            let cfont = conn.generate_id().ok()?;
+            if conn.open_font(cfont, b"cursor").is_ok() {
+                let cursor = conn.generate_id().ok()?;
+                conn.create_glyph_cursor(
+                    cursor, cfont, cfont,
+                    96, 96, // XC_bottom_right_corner
+                    0, 0, 0, 0xffff, 0xffff, 0xffff,
+                ).ok()?;
+                let _ = conn.close_font(cfont);
+                return Some(cursor);
+            }
+            // Fallback: 1x1 white pixel cursor
+            let root = frame;
+            let cursor = conn.generate_id().ok()?;
+            let pix = conn.generate_id().ok()?;
+            conn.create_pixmap(1, pix, root, 1, 1).ok()?;
+            conn.put_image(
+                xproto::ImageFormat::XY_PIXMAP,
+                pix,
+                gc,
+                1, 1, 0, 0, 0, 1,
+                &[0x01u8],
             ).ok()?;
-            let _ = conn.conn().close_font(font);
+            conn.create_cursor(cursor, pix, pix, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0, 0).ok()?;
             Some(cursor)
         })();
 

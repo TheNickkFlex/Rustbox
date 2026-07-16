@@ -232,35 +232,11 @@ impl BScreen {
 
         // Give the root a visible cursor so the pointer is not invisible, and
         // paint a solid desktop background.
-        if let Ok(cursor_font) = screen.conn.conn().generate_id() {
-            if screen.conn.conn().open_font(cursor_font, b"cursor").is_ok() {
-                if let Ok(cursor) = screen.conn.conn().generate_id() {
-                    if screen
-                        .conn
-                        .conn()
-                        .create_glyph_cursor(
-                            cursor,
-                            cursor_font,
-                            cursor_font,
-                            68,
-                            69,
-                            0,
-                            0,
-                            0,
-                            0xffff,
-                            0xffff,
-                            0xffff,
-                        )
-                        .is_ok()
-                    {
-                        let _ = screen.conn.conn().change_window_attributes(
-                            root,
-                            &ChangeWindowAttributesAux::new().cursor(cursor),
-                        );
-                    }
-                    let _ = screen.conn.conn().close_font(cursor_font);
-                }
-            }
+        if let Some(cursor) = screen.create_root_cursor() {
+            let _ = screen.conn.conn().change_window_attributes(
+                root,
+                &ChangeWindowAttributesAux::new().cursor(cursor),
+            );
         }
         // Original Rustbox desktop is a neutral gray rather than black. Paint
         // the bundled wallpaper if it loads; otherwise fall back to gray.
@@ -405,6 +381,49 @@ impl BScreen {
         }
 
         Ok(screen)
+    }
+
+    /// Create a visible root cursor.
+    ///
+    /// Tries the X core cursor font first (works on Xorg). Falls back to
+    /// creating a cursor from an embedded 1x1 bitmap (works on servers
+    /// without the core cursor font, such as yserver).
+    fn create_root_cursor(&self) -> Option<u32> {
+        let conn = self.conn.conn();
+
+        // Try core cursor font first
+        let cursor_font = conn.generate_id().ok()?;
+        if conn.open_font(cursor_font, b"cursor").is_ok() {
+            let cursor = conn.generate_id().ok()?;
+            if conn
+                .create_glyph_cursor(cursor, cursor_font, cursor_font, 68, 69, 0, 0, 0, 0xffff, 0xffff, 0xffff)
+                .is_ok()
+            {
+                let _ = conn.close_font(cursor_font);
+                return Some(cursor);
+            }
+            let _ = conn.close_font(cursor_font);
+            return None;
+        }
+
+        // Fallback: create a 1x1 white-pixel cursor
+        let root = self.root_window();
+        let cid = conn.generate_id().ok()?;
+        let pix = conn.generate_id().ok()?;
+        conn.create_pixmap(1, pix, root, 1, 1).ok()?;
+        let gc = conn.generate_id().ok()?;
+        conn.create_gc(gc, root, &x11rb::protocol::xproto::CreateGCAux::new()).ok()?;
+        conn.put_image(
+            x11rb::protocol::xproto::ImageFormat::XY_PIXMAP,
+            pix,
+            gc,
+            1, 1, 0, 0, 0, 1,
+            &[0x01u8],
+        )
+        .ok()?;
+        conn.create_cursor(cid, pix, pix, 0xffff, 0xffff, 0xffff, 0, 0, 0, 0, 0)
+            .ok()?;
+        Some(cid)
     }
 
     /// Load keybindings from file (or defaults) and register X11 grabs.
