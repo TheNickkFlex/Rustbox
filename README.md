@@ -20,6 +20,14 @@ toolbar, a slit for dock apps, and a system tray — plus a built-in,
 dunst-compatible notification daemon so you don't need a separate daemon
 running.
 
+This is a **Cargo workspace** — one `cargo build --release` produces all
+binaries:
+
+| Binary | Path | Description |
+|--------|------|-------------|
+| `rustbox` | `target/release/rustbox` | The window manager |
+| `rustbox-terminal` | `target/release/rustbox-terminal` | Minimal X11 terminal emulator (launched from the root menu) |
+
 - **No autotools, no make, no gcc.** Just `cargo build`.
 - **No cairo, no pango.** Text is rendered with `fontdb` + `ab_glyph`
   (anti-aliased TrueType) plus emoji support (`skrifa` / `ttf-parser`).
@@ -187,8 +195,9 @@ rustbox
 Rustbox uses `$DISPLAY` by default. You can override with `-display :1`.
 The `-socket` flag also works for direct X socket paths.
 
-The root menu launches **kitty** as the default terminal emulator. Make sure
-it is installed.
+The root menu launches **rustbox-terminal** (built in the same workspace) as the
+default terminal emulator. Make sure `rustbox-terminal` is in your `PATH`
+(e.g. link it: `ln -s "$PWD/target/release/rustbox-terminal" ~/.local/bin/`).
 
 ## Configuration
 

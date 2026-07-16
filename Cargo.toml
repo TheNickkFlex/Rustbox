@@ -1,3 +1,10 @@
+[workspace]
+members = [
+    ".",
+    "terminal",
+]
+resolver = "2"
+
 [package]
 name = "rustbox-rs"
 version = "1.4.0"
@@ -74,7 +81,6 @@ futures-util = "0.3"
 # Async mpsc channels for the SNI thread (avoids busy-poll on std mpsc)
 futures-channel = "0.3"
 
-# Terminal emulator: kitty (external binary, not a crate dependency)
 
 [profile.release]
 lto = true
@@ -90,3 +96,6 @@ opt-level = 3
 [[bin]]
 name = "rustbox"
 path = "src/main.rs"
+
+[patch.crates-io]
+terminal-emulator = { path = "terminal/patches/terminal-emulator" }

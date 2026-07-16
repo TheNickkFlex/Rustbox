@@ -1,0 +1,13 @@
+[package]
+name = "rustbox-terminal"
+version = "1.4.0"
+edition = "2021"
+description = "Minimal X11 terminal emulator (part of rustbox-rs)"
+
+[dependencies]
+x11rb = { version = "0.13", features = ["allow-unsafe-code"] }
+libc = "0.2"
+anyhow = "1"
+terminal-emulator = "0.1.0"
+ab_glyph = "0.2"
+fontdb = "0.21"

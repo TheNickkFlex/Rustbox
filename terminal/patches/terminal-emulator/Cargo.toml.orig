@@ -1,0 +1,19 @@
+[package]
+name = "terminal-emulator"
+description = "A helper library for building terminal emulators, broken out from alacritty and inspired by libvte"
+license = "MIT"
+version = "0.1.0"
+authors = ["David Flemström <david.flemstrom@gmail.com>"]
+repository = "https://github.com/dflemstr/mux"
+keywords = ["terminal", "vte", "tty", "emulator", "pty"]
+categories = ["command-line-interface", "command-line-utilities", "emulators"]
+edition = "2018"
+
+[dependencies]
+base64 = "0.10.1"
+vte = "0.3.3"
+log = "0.4.6"
+bitflags = "1.0.4"
+static_assertions = "0.3.1"
+arraydeque = "0.4.3"
+unicode-width = "0.1.5"

@@ -798,7 +798,7 @@ impl BScreen {
     }
 
     /// Publish `_NET_WORKAREA` on the root window so EWMH-compliant clients
-    /// (like kitty, alacritty, etc.) know the usable area and don't overlap
+    /// (like alacritty, kitty, etc.) know the usable area and don't overlap
     /// the toolbar, slit, or tray.
     pub fn publish_workarea(&self) -> Result<(), anyhow::Error> {
         let root = self.root_window;
@@ -2001,7 +2001,7 @@ impl BScreen {
 
         items.push(MenuItem::separator());
         items.push(MenuItem::new("Run Command...", MenuItemType::RunDialog));
-        items.push(MenuItem::new("kitty terminal", MenuItemType::Exec("kitty".to_string())));
+        items.push(MenuItem::new("rustbox-terminal", MenuItemType::Exec("rustbox-terminal".to_string())));
         items.push(MenuItem::new("Firefox", MenuItemType::Exec("firefox".to_string())));
         items.push(MenuItem::separator());
         items.push(MenuItem::new("Reload", MenuItemType::Reconfig));
@@ -2093,14 +2093,7 @@ impl BScreen {
             MenuItemType::Exec(cmd) => {
                 self.close_menus()?;
                 log::info!("Menu exec: {}", cmd);
-                let mut cmd_proc = std::process::Command::new("sh");
-                cmd_proc
-                    .args(["-c", &cmd])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-                cmd_proc.env("DISPLAY", self.conn.display_name());
-                let _ = cmd_proc.spawn();
+                let _ = spawn_command(&cmd, self.conn.display_name());
             }
             MenuItemType::Exit => {
                 self.close_menus()?;
@@ -2816,14 +2809,7 @@ impl BScreen {
                 }
             }
             KeyAction::Exec(cmd) => {
-                let mut cmd_proc = std::process::Command::new("sh");
-                cmd_proc
-                    .args(["-c", cmd])
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-                cmd_proc.env("DISPLAY", self.conn.display_name());
-                let _ = cmd_proc.spawn();
+                let _ = spawn_command(cmd, self.conn.display_name());
             }
         }
         Ok(())
@@ -2847,5 +2833,38 @@ fn hide_submenus(conn: &X11Connection, menu: &Menu) -> Result<(), anyhow::Error>
         hide_submenus(conn, sub)?;
         sub.hide(conn)?;
     }
+    Ok(())
+}
+
+/// Resolve a bare command name relative to the rustbox binary directory and
+/// spawn it.  This lets sibling binaries (e.g. `rustbox-terminal`) work even
+/// when they are not on `$PATH`.
+fn spawn_command(cmd: &str, display: &str) -> Result<(), anyhow::Error> {
+    let resolved = if !cmd.contains('/') {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let sibling = dir.join(cmd);
+                if sibling.exists() {
+                    sibling.to_string_lossy().to_string()
+                } else {
+                    cmd.to_string()
+                }
+            } else {
+                cmd.to_string()
+            }
+        } else {
+            cmd.to_string()
+        }
+    } else {
+        cmd.to_string()
+    };
+    let mut cmd_proc = std::process::Command::new("sh");
+    cmd_proc
+        .args(["-c", &resolved])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    cmd_proc.env("DISPLAY", display);
+    let _ = cmd_proc.spawn();
     Ok(())
 }
