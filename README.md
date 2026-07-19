@@ -237,3 +237,5 @@ Rustbox is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 - **[dunst](https://github.com/dunst-project/dunst)** — *Recreated in Rust*
 - **[zbus](https://github.com/z-galaxy/zbus)** — *Made in Rust*
 - **[wallpaper-base](https://www.magnific.com/free-vector/background-luxury-minimalist-gradient-style-design_32582903.htm#fromView=keyword&page=1&position=0&uuid=dd98b9e7-a54e-4904-87ae-492fee8f5aa9&query=Minimalist+black+white+wallpaper)** — *The Base For Rustbox Wallpaper*
+- **[alacritty](https://github.com/alacritty/alacritty)** — *Made in Rust*
+- **[picom](https://github.com/yshui/picom)** — *Recreated in Rust*
