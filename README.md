@@ -1,5 +1,5 @@
 <p align="center">
-    <img width="200" alt="Rustbox Logo" src="https://github.com/TheNickkFlex/Rustbox/blob/main/canvas.png">
+    <img width="600" alt="Rustbox Logo" src="https://github.com/TheNickkFlex/Rustbox/blob/main/canvas.png">
 </p>
 
 <h1 align="center">Rustbox - A fast, Open-source, Powerful WM but i think its a DE, Idk lol</h1>
