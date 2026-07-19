@@ -1,6 +1,13 @@
-# Rustbox
+<p align="center">
+    <img width="200" alt="Rustbox Logo" src="">
+</p>
 
-A fluxbox-based window manager written entirely in **Rust** (X11).
+<h1 align="center">Rustbox - A fast, Open-source, Powerful WM but i think its a DE, Idk lol</h1>
+
+<p align="center">
+  <img alt="A fluxbox-based window manager written entirely in **Rust** (X11)."
+       src="">
+</p>
 
 
 ## Beta Preview - *No Wallpaper Mode (Less Resource Usage, More About In Compile-time features)*
